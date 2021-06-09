@@ -545,10 +545,12 @@ proc run_repl*(r: TLLRepl, libpath: string, libs: openArray[string], imports: se
          func make_gb(s: string): string
          func make_tchar(s: string): string
          func make_utf8(s: string): string
-         func cpu_time(): float
-         func epoch_time(): float
-         proc now(): string
-         proc today(): string
+
+   ctx.vm_native:
+      func cpu_time(): float
+      func epoch_time(): float
+      proc now(): string
+      proc today(): string
 
    graph.vm = ctx
    graph.compileSystemModule()
