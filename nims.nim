@@ -138,10 +138,12 @@ func is_import_line(s: string): bool =
    s.startsWith("import ") or s.startsWith("from ") or s.startsWith("include ")
 
 proc disable_stdout() =
-   discard reopen(stdout, "NUL", fmWrite)
+   const device = when defined(windows): "NUL" else: "/dev/null"
+   discard reopen(stdout, device, fmWrite)
 
 proc enable_stdout() =
-   discard reopen(stdout, "CON", fmWrite)
+   const device = when defined(windows): "CON" else: "/dev/console"
+   discard reopen(stdout, device, fmWrite)
 
 proc get_prompt(indent_level, line_no: int): string =
    let prompt_str = if indent_level == 0: ">>> " else: ">++ "
