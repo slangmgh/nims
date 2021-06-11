@@ -45,6 +45,7 @@ type
    ErrorHook = proc(config: ConfigRef; info: TLineInfo; msg: string; severity: Severity) {.closure, gcsafe.}
    RunContext = ref object
       conf: ConfigRef
+      main_module: PSym
 
       input_stream: PLLStream
 
@@ -613,11 +614,12 @@ proc setup_vm_config(ctx: RunContext, conf: ConfigRef) =
 
    setup_vm_config_define(conf)
 
-proc create_script_vm(graph: ModuleGraph): PCtx =
-   var m = graph.makeModule(AbsoluteFile"script")
-   incl(m.flags, sfMainModule)
+proc create_script_vm(ctx: RunContext, graph: ModuleGraph): PCtx =
+   const name = "script"
+   var m = graph.makeModule(AbsoluteFile name)
+   ctx.main_module = m
 
-   var vm = setupVM(m, graph.cache, "stdin", graph, idGeneratorFromModule(m))
+   var vm = setupVM(m, graph.cache, name, graph, idGeneratorFromModule(m))
    graph.vm = vm
    return vm
 
@@ -662,7 +664,7 @@ proc setup_vm_environment(ctx: RunContext, graph: ModuleGraph) =
    setup_config_error_hook(ctx)
    setup_interactive_passes(graph)
 
-   var vm = create_script_vm(graph)
+   var vm = create_script_vm(ctx, graph)
    vm.register_custom_vmops(ctx, graph)
    load_preload_module(ctx, graph)
 
@@ -678,7 +680,7 @@ proc run_repl(ctx: RunContext) =
       try:
          ctx.init()
          let vm = cast[PCtx](graph.vm)
-         graph.processModule(vm.module, vm.idgen, ctx.input_stream)
+         graph.processModule(ctx.main_module, vm.idgen, ctx.input_stream)
       except ResetError:
          break
       except ReloadError:
