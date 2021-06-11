@@ -34,6 +34,7 @@ type
    RunOption = enum
       opt_verbose
       opt_save_nims_code
+      opt_no_preload_module
       opt_paste_mode
       opt_exception_to_reset_module
       opt_error_to_reload_code
@@ -43,6 +44,12 @@ type
    ErrorHook = proc(config: ConfigRef; info: TLineInfo; msg: string; severity: Severity) {.closure, gcsafe.}
    RunContext = ref object
       conf: ConfigRef
+
+      input_stream: PLLStream
+
+      libpath: string
+      libs: seq[string]
+      imports: seq[string]
 
       options: set[RunOption]
       max_compiler_errors: int
@@ -56,6 +63,12 @@ type
 
       pre_load_code: string
       input_lines_good: seq[string]
+
+proc init(ctx: RunContext) =
+   ctx.last_line_need_reset = false
+   ctx.last_line_has_error = false
+   ctx.last_line_is_import = false
+   ctx.last_input_line = ""
 
 template on(o: RunOption): bool = o in ctx.options
 
@@ -428,7 +441,7 @@ proc get_line(ctx: RunContext): string =
 
    return ctx.last_input_line
 
-proc get_ll_stream(ctx: RunContext): PLLStream =
+proc setup_input_stream(ctx: RunContext) =
    proc llReadFromStdin(s: PLLStream, buf: pointer, bufLen: int): int =
       # Ensure the output is fine
       enable_output(ctx.conf)
@@ -454,9 +467,9 @@ proc get_ll_stream(ctx: RunContext): PLLStream =
          copyMem(buf, addr(s.s[s.rd]), result)
          inc(s.rd, result)
 
-   return llStreamOpenStdIn(llReadFromStdin)
+   ctx.input_stream = llStreamOpenStdIn(llReadFromStdin)
 
-proc get_compile_error_handler(ctx: RunContext): ErrorHook =
+proc setup_config_error_hook(ctx: RunContext) =
    proc on_compile_error(conf: ConfigRef; info: TLineInfo; msg: string; severity: Severity) {.gcsafe.} =
       if severity == Error and conf.m.errorOutputs.len != 0:
          if ctx.last_line_is_import:
@@ -473,24 +486,7 @@ proc get_compile_error_handler(ctx: RunContext): ErrorHook =
          else:
             ctx.last_line_has_error = true
 
-   return on_compile_error
-
-proc interactivePasses(graph: ModuleGraph) =
-   initDefines(graph.config.symbols)
-   defineSymbol(graph.config.symbols, "nimconfig")
-   defineSymbol(graph.config.symbols, "nimscript")
-
-   when hasFFI:
-      defineSymbol(graph.config.symbols, "nimffi")
-      defineSymbol(graph.config.symbols, "nimHasLibFFI")
-
-   when my_special_vmops:
-      defineSymbol(graph.config.symbols, "nimVmops")
-
-   undefSymbol(graph.config.symbols, "nimv2")
-
-   registerPass(graph, semPass)
-   registerPass(graph, evalPass)
+   ctx.conf.structuredErrorHook = on_compile_error
 
 proc now(): string = times.now().format("HH:mm:ss")
 proc today(): string = times.now().format("yyyy-MM-dd")
@@ -506,6 +502,7 @@ proc safe_compile_module(graph: ModuleGraph, ctx: RunContext, mf: AbsoluteFile):
          if conf.errorCounter >= ctx.max_compiler_errors:
             raise Reset()
 
+   let old_hook = conf.structuredErrorHook
    conf.errorCounter = 0
    conf.structuredErrorHook = on_compile_error
    try:
@@ -513,11 +510,11 @@ proc safe_compile_module(graph: ModuleGraph, ctx: RunContext, mf: AbsoluteFile):
    except:
       success = false
    finally:
-      conf.structuredErrorHook = nil
+      conf.structuredErrorHook = old_hook
 
    success
 
-proc register_my_vmops(vm: PEvalContext, graph: ModuleGraph, ctx: RunContext) =
+proc register_my_vmops(vm: PEvalContext, ctx: RunContext, graph: ModuleGraph) =
    var
       conf = ctx.conf
 
@@ -549,17 +546,31 @@ proc register_my_vmops(vm: PEvalContext, graph: ModuleGraph, ctx: RunContext) =
    conf.implicitImports.add sf
    discard graph.safe_compile_module(ctx, AbsoluteFile sf)
 
-proc run_repl*(ctx: RunContext, libpath: string, libs: openArray[string], imports: seq[string]) =
-   var conf = ctx.conf
-   var cache = newIdentCache()
-   var graph = newModuleGraph(cache, conf)
+proc setup_interactive_passes(graph: ModuleGraph) =
+   registerPass(graph, semPass)
+   registerPass(graph, evalPass)
 
-   conf.searchPaths.add libpath.AbsoluteDir
-   for p in libs:
+proc setup_vm_config_define(conf: ConfigRef) =
+   initDefines(conf.symbols)
+   defineSymbol(conf.symbols, "nimconfig")
+   defineSymbol(conf.symbols, "nimscript")
+
+   when hasFFI:
+      defineSymbol(conf.symbols, "nimffi")
+      defineSymbol(conf.symbols, "nimHasLibFFI")
+
+   when my_special_vmops:
+      defineSymbol(conf.symbols, "nimVmops")
+
+   undefSymbol(conf.symbols, "nimv2")
+
+proc setup_vm_config(ctx: RunContext, conf: ConfigRef) =
+   conf.searchPaths.add ctx.libpath.AbsoluteDir
+   for p in ctx.libs:
       let p = p.AbsoluteDir
       conf.searchPaths.add(p)
 
-   conf.libpath = libpath.AbsoluteDir
+   conf.libpath = ctx.libpath.AbsoluteDir
    conf.cmd = cmdInteractive
    conf.errorMax = high(int)
    conf.spellSuggestMax = 0
@@ -582,14 +593,18 @@ proc run_repl*(ctx: RunContext, libpath: string, libs: openArray[string], import
    when hasFFI:
       conf.features.incl compiletimeFFI
 
-   interactivePasses(graph)
+   setup_vm_config_define(conf)
+
+proc setup_script_main_module(graph: ModuleGraph): PCtx =
    var m = graph.makeModule(AbsoluteFile"script")
    incl(m.flags, sfMainModule)
 
-   var vm = setupVM(m, cache, "stdin", graph, idGeneratorFromModule(m))
+   var vm = setupVM(m, graph.cache, "stdin", graph, idGeneratorFromModule(m))
    graph.vm = vm
+   return vm
 
-   vm.register_my_vmops(graph, ctx)
+proc load_preload_module(ctx: RunContext, graph: ModuleGraph) =
+   var conf = graph.config
 
    if opt_check_failed_module_time.on:
       ctx.options.excl opt_check_failed_module_time
@@ -598,11 +613,13 @@ proc run_repl*(ctx: RunContext, libpath: string, libs: openArray[string], import
    var pre_compile_module: seq[string]
 
    # 预编译这些模块，这样在出现异常重新加载的时候，就不需要重新解析了
-   var pre_load_module = @["strutils", "strformat", "os", "tables", "sets", "math", "json", "macros"]
-   when not my_special_vmops:
-      pre_load_module.add "sequtils"
+   var pre_load_module: seq[string]
+   if not opt_no_preload_module.on:
+      pre_load_module =  @["strutils", "strformat", "os", "tables", "sets", "math", "json", "macros"]
+      when not my_special_vmops:
+         pre_load_module.add "sequtils"
 
-   for f in pre_load_module & imports:
+   for f in pre_load_module & ctx.imports:
       if not is_failed_module(ctx, f):
          let mf = findFile(conf, f & ".nim")
          if not mf.isEmpty:
@@ -613,9 +630,24 @@ proc run_repl*(ctx: RunContext, libpath: string, libs: openArray[string], import
                pre_compile_module.add f
 
    # 缺省import的模块
-   ctx.pre_load_code = "import " & pre_compile_module.join(",") & "\p"
+   if pre_compile_module.len > 0:
+      ctx.pre_load_code = "import " & pre_compile_module.join(",") & "\p"
+   else:
+      ctx.pre_load_code = ""
 
-   conf.structuredErrorHook = get_compile_error_handler(ctx)
+proc setup_vm_environment(ctx: RunContext, graph: ModuleGraph) =
+   setup_input_stream(ctx)
+   setup_vm_config(ctx, graph.config)
+   setup_config_error_hook(ctx)
+   setup_interactive_passes(graph)
+
+   var vm = setup_script_main_module(graph)
+   vm.register_my_vmops(ctx, graph)
+   load_preload_module(ctx, graph)
+
+proc run_repl(ctx: RunContext) =
+   var graph = newModuleGraph(newIdentCache(), ctx.conf)
+   setup_vm_environment(ctx, graph)
 
    # 存在3种类型的出错：
    # 1. 输入代码语法错，一般不需要额外操作，只是把错误的代码忽略就可以
@@ -623,9 +655,9 @@ proc run_repl*(ctx: RunContext, libpath: string, libs: openArray[string], import
    # 3. 如果输入import times这种，可能会破坏整个vm，这个时候需要重建整个环境，就是reset
    while true:
       try:
-         ctx.last_line_need_reset = false
-         ctx.last_line_has_error = false
-         graph.processModule(m, vm.idgen, get_ll_stream(ctx))
+         ctx.init()
+         let vm = cast[PCtx](graph.vm)
+         graph.processModule(vm.module, vm.idgen, ctx.input_stream)
       except ResetError:
          break
       except ReloadError:
@@ -641,7 +673,7 @@ proc run_repl*(ctx: RunContext, libpath: string, libs: openArray[string], import
          if opt_exception_to_reset_module.on:
             break
 
-proc ctrl_c_proc*() {.noconv.} =
+proc ctrl_c_proc() {.noconv.} =
    quit "CTRL-C pressed, quit."
 
 proc main() =
@@ -675,17 +707,20 @@ proc main() =
    for p in walkDir(pkg_dir):
       libs.add p.path
 
-   var ctx = RunContext(max_compiler_errors: 10)
+   var ctx = RunContext(max_compiler_errors: 10, libpath: nimlib, libs: libs)
    if args.anyIt(it.startsWith("-cache") or it.startsWith("--cache")):
       ctx.options.incl opt_save_nims_code
       ctx.input_lines_good = load_nims_cache_file()
 
-   let imports = args.filterIt(not it.startsWith("-"))
+   if args.anyIt(it.startsWith("-no-preload-module") or it.startsWith("--no-preload-module")):
+      ctx.options.incl opt_no_preload_module
+
+   ctx.imports = args.filterIt(not it.startsWith("-"))
    set_control_chook(ctrl_c_proc)
    while true:
       try:
          ctx.conf = newConfigRef()
-         run_repl(ctx, nimlib, libs, imports)
+         run_repl(ctx)
       except:
          discard
 
