@@ -9,7 +9,7 @@
 ## >>> nim c -d:release -d:nimcore nims.nim
 ##
 
-import os, terminal, strutils, sequtils, times, macros, strformat
+import os, terminal, strutils, sequtils, times, macros, strformat, parseopt
 import "../../compiler" / [ast, astalgo, modules, passes, condsyms,
        options, sem, semdata, llstream, vm, vmdef, nimeval, lineinfos, msgs,
        modulegraphs, idents, pathutils, passaux, scriptconfig, parser]
@@ -35,11 +35,11 @@ type
       opt_verbose
       opt_save_nims_code
       opt_no_preload_module
-      opt_paste_mode
       opt_exception_to_reset_module
       opt_import_error_to_reset_module
       opt_error_to_reload_code
       opt_check_failed_module_time
+      opt_paste_mode
       opt_using_ic_cache
 
    ErrorHook = proc(config: ConfigRef; info: TLineInfo; msg: string; severity: Severity) {.closure, gcsafe.}
@@ -702,22 +702,45 @@ proc ctrl_c_proc() {.noconv.} =
    quit "CTRL-C pressed, quit."
 
 proc main() =
-   var nimlib = ""
+   var
+      nimlib = ""
+      imports: seq[string]
+      ctx = RunContext(max_compiler_errors: 10)
 
-   let args = commandLineParams().mapIt((if it[0] == '-' and it.len >= 3 and it[1] != '-': "-" & it else: it))
-   let libs_arg = args.filterIt(it.startsWith("--lib:"))
-   if libs_arg.len > 0:
-      for arg in libs_arg:
-         var s = arg.split(':')[1]
-         if file_exists(s / "system.nim"):
-            nimlib = s
-            break
+   let argv = commandLineParams().mapIt((if it[0] == '-' and it.len >= 3 and it[1] != '-': "-" & it else: it))
+   for kind, key, val in getopt(cmdline = argv):
+      case kind
+      of cmdArgument:
+         imports.add key
+      of cmdLongOption, cmdShortOption:
+         case key
+         of "lib":
+            if file_exists(val / "system.nim"):
+               nimlib = val
+         of "cache":
+            ctx.options.incl opt_save_nims_code
+            ctx.input_lines_good = load_nims_cache_file()
+         of "no-preload-module":
+            ctx.options.incl opt_no_preload_module
+         of "import-error-to-reset":
+            ctx.options.incl opt_import_error_to_reset_module
+         of "exception-to-reset":
+            ctx.options.incl opt_exception_to_reset_module
+         of "error-to-reload":
+            ctx.options.incl opt_error_to_reload_code
+         of "max-compiler-errors":
+            ctx.max_compiler_errors = parseInt(val)
+         else:
+            echo &"Unknown option [{key} {val}]\p"
+            quit()
+      of cmdEnd: discard
 
    if nimlib == "":
       nimlib = findNimStdLib()
 
    if nimlib == "":
-      quit("Cannot find nim.exe in the PATH")
+      const exe_ext = when defined(windows): ".exe" else: ""
+      quit(&"Cannot find nim{exe_ext} in the PATH")
 
    var libs = @[nimlib / "core",
                 nimlib / "pure",
@@ -732,24 +755,10 @@ proc main() =
    for p in walkDir(pkg_dir):
       libs.add p.path
 
-   var ctx = RunContext(max_compiler_errors: 10, libpath: nimlib, libs: libs)
-   if args.anyIt(it.startsWith("--cache")):
-      ctx.options.incl opt_save_nims_code
-      ctx.input_lines_good = load_nims_cache_file()
+   ctx.libpath = nimlib
+   ctx.libs = libs
+   ctx.imports = imports
 
-   if args.anyIt(it.startsWith("--no-preload-module")):
-      ctx.options.incl opt_no_preload_module
-
-   if args.anyIt(it.startsWith("--import-error-to-reset")):
-      ctx.options.incl opt_import_error_to_reset_module
-
-   if args.anyIt(it.startsWith("--exception-to-reset")):
-      ctx.options.incl opt_exception_to_reset_module
-
-   if args.anyIt(it.startsWith("--error-to-reload")):
-      ctx.options.incl opt_error_to_reload_code
-
-   ctx.imports = args.filterIt(not it.startsWith("-"))
    set_control_chook(ctrl_c_proc)
    while true:
       try:
