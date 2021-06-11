@@ -1,4 +1,13 @@
-## nims.nim
+##
+## simple nim repl
+##
+## compile with libffi, must use gcc
+## >>> nimble install libffi
+## >>> nim c --cc:gcc -d:release -d:nimcore -d:nimHasLibFFI nims.nim
+##
+## compile without libffi
+## >>> nim c -d:release -d:nimcore nims.nim
+##
 
 import os, terminal, strutils, sequtils, times, macros, strformat
 import "../../compiler" / [ast, astalgo, modules, passes, condsyms,
@@ -21,48 +30,54 @@ const
 let
    nims_cache_file = getTempDir() / "nims_cache_file.nim"
 
-var
-   using_ic_cache = false
-   restart_eval = true
-   pre_load_code = ""
+type
+   RunOption = enum
+      opt_verbose
+      opt_save_nims_code
+      opt_paste_mode
+      opt_exception_to_reset_module
+      opt_error_to_reload_code
+      opt_check_failed_module_time
+      opt_using_ic_cache
 
-   failed_imports: seq[tuple[name: string, fullname: string, time: Time]]
-   check_failed_module_time = false
+   ErrorHook = proc(config: ConfigRef; info: TLineInfo; msg: string; severity: Severity) {.closure, gcsafe.}
+   RunContext = ref object
+      conf: ConfigRef
 
-   save_nims_code = false
-   verbose = false
-   paste_mode = false
-   exception_to_reset_module = false
-   error_to_reload_code = false
+      options: set[RunOption]
+      max_compiler_errors: int
 
-   last_input_line = ""
-   last_line_is_import = false
-   input_lines_good: seq[string]
-   cur_error_count = 0
+      failed_imports: seq[tuple[name: string, fullname: string, time: Time]]
 
-   last_line_has_error = false
-   last_line_need_reset = false
+      last_input_line: string
+      last_line_is_import: bool
+      last_line_has_error: bool
+      last_line_need_reset: bool
 
-   max_compiler_errors = 10
+      pre_load_code: string
+      input_lines_good: seq[string]
 
-   cur_conf: ConfigRef
-   cur_graph: ModuleGraph
-   cur_module: PSym
+template on(o: RunOption): bool = o in ctx.options
 
+proc toggle_option(ctx: RunContext, o: RunOption) =
+   if o in ctx.options:
+      ctx.options.excl o
+   else:
+      ctx.options.incl o
 
-proc add_failed_module(name, fullname: string) =
+proc add_failed_module(ctx: RunContext, name, fullname: string) =
    let time = getLastModificationTime(fullname)
-   failed_imports.add (name, fullname, time)
+   ctx.failed_imports.add (name, fullname, time)
 
-proc is_failed_module(name: string): bool =
-   failed_imports.anyIt(it.name == name)
+proc is_failed_module(ctx: RunContext, name: string): bool =
+   ctx.failed_imports.anyIt(it.name == name)
 
-proc refresh_failed_module_with_last_mod_time() =
-   failed_imports = failed_imports.filterIt(it.time == getLastModificationTime(it.fullname))
+proc refresh_failed_module_with_last_mod_time(ctx: RunContext) =
+   ctx.failed_imports = ctx.failed_imports.filterIt(it.time == getLastModificationTime(it.fullname))
 
 var native_import_procs {.compileTime.} : string
 
-macro vmops(ctx: PCtx, op: untyped, argtypes: varargs[untyped]): untyped =
+macro vmops(vm: PCtx, op: untyped, argtypes: varargs[untyped]): untyped =
    let op_wrapper = ident($op & "_wrapper")
    let a = ident("a")
    var call_op = newCall(op)
@@ -73,14 +88,14 @@ macro vmops(ctx: PCtx, op: untyped, argtypes: varargs[untyped]): untyped =
    quote do:
       proc `op_wrapper`(`a`: VmArgs) {.nimcall.} =
          setResult(`a`, `call_op`)
-      `ctx`.registerCallback(`op`.ast_to_str, `op_wrapper`)
+      `vm`.registerCallback(`op`.ast_to_str, `op_wrapper`)
 
-macro vm_native(ctx: PCtx, list: untyped): untyped =
+macro vm_native_proc(vm: PCtx, list: untyped): untyped =
    var vmops_calls = newStmtList()
    for p in list:
       if p.kind in [nnkProcDef, nnkFuncDef]:
          var op = p.name
-         var pcall = newCall("vmops", `ctx`, `op`)
+         var pcall = newCall("vmops", `vm`, `op`)
 
          native_import_procs.add "proc " & $p.name & "*("
          let params = p.params
@@ -103,7 +118,7 @@ template with_color(fg: ForegroundColor, bright = false, body: untyped) =
       body
    resetAttributes()
 
-proc count_triples(s: string): int =
+func count_triples(s: string): int =
   var i = 0
   while i+2 < s.len:
     if s[i] == '"' and s[i+1] == '"' and s[i+2] == '"':
@@ -111,14 +126,14 @@ proc count_triples(s: string): int =
       inc i, 2
     inc i
 
-proc continue_line*(line: string): bool =
+func continue_line*(line: string): bool =
    line.len > 0 and
       ((line[^1] in indent_oprs) or indent_keys.anyIt(line.endsWith(it)))
 
-proc is_all_space(line: string): bool =
+func is_all_space(line: string): bool =
    line == "" or line.allIt(it == ' ')
 
-proc is_import_line(s: string): bool =
+func is_import_line(s: string): bool =
    let s = s.strip
    s.startsWith("import ") or s.startsWith("from ") or s.startsWith("include ")
 
@@ -129,12 +144,8 @@ proc enable_stdout() =
    discard reopen(stdout, "CON", fmWrite)
 
 proc get_prompt(indent_level, line_no: int): string =
-   if restart_eval:
-      restart_eval = false
-      "01>>> "
-   else:
-      let prompt_str = if indent_level == 0: ">>> " else: ">++ "
-      &"{line_no:<02}{prompt_str}{indent_spaces.repeat(indent_level)}"
+   let prompt_str = if indent_level == 0: ">>> " else: ">++ "
+   &"{line_no}{prompt_str}{indent_spaces.repeat(indent_level)}"
 
 proc show_raw_buffer(buffer: string, header: string) =
    with_color(fgCyan, false):
@@ -147,10 +158,9 @@ proc show_raw_buffer(buffer: string, header: string) =
       echo '-'.repeat(70)
 
 proc save_nims_cache_file(lines: seq[string]) =
-   if save_nims_code:
-      let file = open(nims_cache_file, fmWrite)
-      defer: file.close
-      file.write(lines.join(""))
+   let file = open(nims_cache_file, fmWrite)
+   defer: file.close
+   file.write(lines.join(""))
 
 proc load_nims_cache_file(): seq[string] =
    if file_exists(nims_cache_file):
@@ -165,27 +175,6 @@ proc readLineFromStdin(prompt: string): (string, bool) =
    let time_end = cpuTime()
    let is_paste = time_end - time_start < 0.08
    (s, is_paste)
-
-when false:
-   # fix when time avalaible
-   proc selectUniqueSymbol(graph: ModuleGraph, module: PSym, name: string;
-                            symKinds: set[TSymKind] = {skLet, skVar}): PSym =
-      let n = getIdent(graph.cache, name)
-      var it: ModuleIter
-      var s = initModuleIter(it, graph, module, n)
-      result = nil
-      while s != nil:
-         if s.kind in symKinds:
-            if result == nil: result = s
-            else: return nil # ambiguous
-         s = nextModuleIter(it, graph)
-
-   proc get_global_value(name: string): PNode =
-      let v = selectUniqueSymbol(cur_graph, cur_module, name)
-      if v.isNil:
-         nil
-      else:
-         vm.getGlobalValue(PCtx cur_graph.vm, v)
 
 type ResetError* = object of CatchableError
 type ReloadError* = object of CatchableError
@@ -205,7 +194,7 @@ template Reload(): untyped = newException(ReloadError, "Reload the code")
 ## 切换成正常模式的方式
 ## 1. 用paste命令
 
-proc my_read_line(line_no: int): string =
+proc my_read_line(ctx: RunContext): string =
    template args(n: int, s: string): string = (if cmds.len > n: cmds[n] else: s)
    template argn[T: float|int](n: int, v: T): T =
       if cmds.len > n:
@@ -217,7 +206,7 @@ proc my_read_line(line_no: int): string =
       buffer &= myline & "\p"
       inc(line_no)
 
-   template onoff(v: bool): string = (if v: "on" else: "off")
+   template onoff(v: RunOption): string = (if v in ctx.options: "on" else: "off")
 
    template doCmd(cmd: string) =
       case cmd
@@ -235,99 +224,96 @@ proc my_read_line(line_no: int): string =
       of "exit", "quit", "q", "x":
          quit()
       of "verbose", "debug", "v", "d":
-         verbose = not verbose
+         ctx.toggle_option(opt_verbose)
          setForegroundColor(fgCyan)
          with_color(fgCyan, false):
-            echo "Debug mode is " & verbose.onoff
+            echo "Debug mode is " & opt_verbose.onoff
       of "paste", "p":
-         paste_mode = not paste_mode
+         ctx.toggle_option(opt_paste_mode)
          with_color(fgCyan, false):
-            echo "Paste mode is " & paste_mode.onoff
+            echo "Paste mode is " & opt_paste_mode.onoff
       of "exceptmode", "xm", "except":
-         exception_to_reset_module = not exception_to_reset_module
+         ctx.toggle_option(opt_exception_to_reset_module)
          with_color(fgCyan, false):
-            echo "Exception reset mode is " & exception_to_reset_module.onoff
+            echo "Exception reset mode is " & opt_exception_to_reset_module.onoff
       of "ic", "iccache":
-         using_ic_cache = not using_ic_cache
-         with_color(fgCyan, false):
-            echo "Using incremental cache is " & using_ic_cache.onoff
+         when false:
+            ctx.toggle_option(opt_using_ic_cache)
+            with_color(fgCyan, false):
+               echo "Using incremental cache is " & opt_using_ic_cache.onoff
       of "errormode", "em", "error":
-         error_to_reload_code = not error_to_reload_code
+         ctx.toggle_option(opt_error_to_reload_code)
          with_color(fgCyan, false):
-            echo "Error reload mode is " & error_to_reload_code.onoff
+            echo "Error reload mode is " & opt_error_to_reload_code.onoff
       of "savecode", "sc", "cache":
-         save_nims_code = not save_nims_code
+         ctx.toggle_option(opt_save_nims_code)
          with_color(fgCyan, false):
-            echo "Save nims code is " & save_nims_code.onoff
+            echo "Save nims code is " & opt_save_nims_code.onoff
       of "show", "s":
-         show_raw_buffer(input_lines_good.join(""), "Current buffer")
+         show_raw_buffer(ctx.input_lines_good.join(""), "Current buffer")
       of "maxerrors", "me":
          if cmds.len > 1:
-            max_compiler_errors = argn(1, 10)
+            ctx.max_compiler_errors = argn(1, 10)
          with_color(fgCyan, false):
-            echo "Max compiler errors is " & $max_compiler_errors
+            echo "Max compiler errors is " & $ctx.max_compiler_errors
       of "clean", "clear", "c":
-         if input_lines_good.len > 0:
+         if ctx.input_lines_good.len > 0:
             let clear_line_count = argn(1, -1)
-            if clear_line_count < 0 or clear_line_count >= input_lines_good.len:
-               input_lines_good = @[]
+            if clear_line_count < 0 or clear_line_count >= ctx.input_lines_good.len:
+               ctx.input_lines_good = @[]
                with_color(fgCyan, false):
                   echo "Input buffer is empty"
-               save_nims_cache_file(input_lines_good)
+
+               if opt_save_nims_code.on:
+                  save_nims_cache_file(ctx.input_lines_good)
             else:
-               input_lines_good = input_lines_good[0..^(clear_line_count+1)]
-               show_raw_buffer(input_lines_good.join(""), "Current buffer")
-               save_nims_cache_file(input_lines_good)
+               ctx.input_lines_good = ctx.input_lines_good[0..^(clear_line_count+1)]
+               show_raw_buffer(ctx.input_lines_good.join(""), "Current buffer")
+
+               if opt_save_nims_code.on:
+                  save_nims_cache_file(ctx.input_lines_good)
       of "keep", "k":
-         if input_lines_good.len > 0:
+         if ctx.input_lines_good.len > 0:
             var keep_line_count = argn(1, -1)
             if keep_line_count == 0:
-               input_lines_good = @[]
+               ctx.input_lines_good = @[]
                with_color(fgCyan, false):
                   echo "Input buffer is empty"
-               save_nims_cache_file(input_lines_good)
-            elif keep_line_count > 0 and keep_line_count < input_lines_good.len:
-                  input_lines_good = input_lines_good[0..(keep_line_count-1)]
-                  show_raw_buffer(input_lines_good.join(""), "Current buffer")
-                  save_nims_cache_file(input_lines_good)
+
+               if opt_save_nims_code.on:
+                  save_nims_cache_file(ctx.input_lines_good)
+            elif keep_line_count > 0 and keep_line_count < ctx.input_lines_good.len:
+                  ctx.input_lines_good = ctx.input_lines_good[0..(keep_line_count-1)]
+                  show_raw_buffer(ctx.input_lines_good.join(""), "Current buffer")
+
+                  if opt_save_nims_code.on:
+                     save_nims_cache_file(ctx.input_lines_good)
       of "load", "ll":
-         input_lines_good = load_nims_cache_file()
+         ctx.input_lines_good = load_nims_cache_file()
          raise Reload()
-      of "check":
-         when false:
-            let s = args(1, "")
-            if s != "":
-               if get_global_value(s).isNil:
-                  echo "no sym:", s
-               else:
-                  echo "has sym:", s
       of "options", "option", "o":
          with_color(fgCyan, false):
-            echo "Exception reset mode is " & exception_to_reset_module.onoff
-            echo "Error reload mode is " & error_to_reload_code.onoff
-            echo "Save nims code is " & save_nims_code.onoff
-            echo "Paste mode is " & paste_mode.onoff
-            echo "Using incremental cache is " & using_ic_cache.onoff
-            # echo "Debug mode is " & verbose.onoff
-            echo "Max compiler errors is " & $max_compiler_errors
-      of "config":
-         with_color(fgCyan, false):
-            echo "SymbolFiles: ", cur_conf.symbolFiles
-            echo "GC: ", cur_conf.selectedGC
-            echo "Options: ", cur_conf.options
-            echo "GlobalOptions: ", cur_conf.globalOptions
+            echo "Exception reset mode is " & opt_exception_to_reset_module.onoff
+            echo "Error reload mode is " & opt_error_to_reload_code.onoff
+            echo "Save nims code is " & opt_save_nims_code.onoff
+            echo "Paste mode is " & opt_paste_mode.onoff
+            when false:
+               echo "Using incremental cache is " & opt_using_ic_cache.onoff
+            # echo "Verbose mode is " & opt_verbose.onoff
+            echo "Max compiler errors is " & $ctx.max_compiler_errors
       of "reload", "rr":
          raise Reload()
       of "reset", "r", "rs", "rb":
          if cmd == "rs":
-            input_lines_good = @[]
-            save_nims_cache_file(input_lines_good)
+            ctx.input_lines_good = @[]
+            if opt_save_nims_code.on:
+               save_nims_cache_file(ctx.input_lines_good)
 
          if cmd == "rb":
-            failed_imports = @[]
+            ctx.failed_imports = @[]
          else:
             # 手工reset，需要检查编译失败的模块时候需要重新加载
-            check_failed_module_time = true
+            ctx.options.incl opt_check_failed_module_time
 
          raise Reset()
       else:
@@ -337,19 +323,19 @@ proc my_read_line(line_no: int): string =
    var
       buffer = ""
       indent_level = 0
-      line_no = line_no
       triples = 0
+      line_no = 1
 
    while true:
-      var (myline, is_paste) = readLineFromStdin(get_prompt(indent_level, line_no+2))
+      var (myline, is_paste) = readLineFromStdin(get_prompt(indent_level, line_no))
 
-      if paste_mode:
-         paste_mode = false
+      if opt_paste_mode.on:
+         ctx.options.excl opt_paste_mode
          add_line()
          continue
 
       if myline.len > 0 and myline[0] == '#':
-         paste_mode = true
+         ctx.options.incl opt_paste_mode
          continue
 
       if is_paste:
@@ -388,7 +374,7 @@ proc my_read_line(line_no: int): string =
       if indent_level == 0 and buffer != "" and (not need_continue) and (not in_triple_string):
          break
 
-   if verbose:
+   if opt_verbose.on:
       show_raw_buffer(buffer, "Line buffer")
 
    return buffer
@@ -406,16 +392,17 @@ proc enable_output(conf: ConfigRef) =
       conf.writelnHook = nil
       enable_stdout()
 
-proc get_line(lineno: int): string =
-   if last_line_need_reset:
+proc get_line(ctx: RunContext): string =
+   if ctx.last_line_need_reset:
       # 出现代码错误，抛出异常后重置环境
-      last_line_need_reset = false
+      ctx.last_line_need_reset = false
       raise Reset()
 
-   if last_line_has_error:
-      last_line_has_error = false
+   if ctx.last_line_has_error:
+      ctx.last_line_has_error = false
+      ctx.last_input_line = ""
 
-      if error_to_reload_code:
+      if opt_error_to_reload_code.on:
          raise Reload()
       else:
          # 由于出现语法错误的时候，有时会导致下一次输出出现问题，所以
@@ -424,61 +411,68 @@ proc get_line(lineno: int): string =
          # 不过好像现在又正常了，先不用吧
 
          when false:
-            disable_output(cur_conf)
-            last_input_line = ""
+            ctx.last_input_line = ""
+            disable_output(ctx.conf)
             return "echo \" \""
 
-   if lineno == 0:
-      if input_lines_good.len > 0:
-         # 当有初始化代码的时候，不做任何输出
-         disable_output(cur_conf)
+   if ctx.last_input_line != "":
+      if ctx.input_lines_good.len == 0 or ctx.input_lines_good[^1] != ctx.last_input_line:
+         ctx.input_lines_good.add ctx.last_input_line
+         if opt_save_nims_code.on:
+            save_nims_cache_file(ctx.input_lines_good)
 
-      last_input_line = ""
-      return pre_load_code & input_lines_good.join("")
-   else:
-      if last_input_line != "":
-         input_lines_good.add last_input_line
-         save_nims_cache_file(input_lines_good)
+   ctx.last_input_line = my_read_line(ctx)
+   ctx.last_line_is_import = ctx.last_input_line.is_import_line
 
-      last_input_line = my_read_line(lineno)
-      last_line_is_import = last_input_line.is_import_line
-      if last_line_is_import:
-         cur_error_count = cur_conf.errorCounter
+   return ctx.last_input_line
 
-      return last_input_line
+proc get_ll_stream(ctx: RunContext): PLLStream =
+   proc llReadFromStdin(s: PLLStream, buf: pointer, bufLen: int): int =
+      # 确保输出正常
+      enable_output(ctx.conf)
 
-proc llReadFromStdin(s: PLLStream, buf: pointer, bufLen: int): int =
-   # 读取代码前确保输出正常
-   enable_output(cur_conf)
+      s.rd = 0
+      if s.lineOffset < 0:
+         ctx.last_input_line = ""
 
-   if s.lineOffset < 0:
+         # 初始化import代码，不做任何输出
+         disable_output(ctx.conf)
+         s.s = ctx.pre_load_code & ctx.input_lines_good.join("")
+      else:
+         s.s = get_line(ctx)
+
+      # 执行前总是reset错误数
+      ctx.conf.errorCounter = 0
+
+      # 设置lineOffset为0, 以确保报错信息和显示行号一致
       s.lineOffset = 0
 
-   s.rd = 0
-   s.s = get_line(s.lineOffset)
+      result = min(bufLen, s.s.len - s.rd)
+      if result > 0:
+         copyMem(buf, addr(s.s[s.rd]), result)
+         inc(s.rd, result)
 
-   inc(s.lineOffset)
-   result = min(bufLen, s.s.len - s.rd)
-   if result > 0:
-      copyMem(buf, addr(s.s[s.rd]), result)
-      inc(s.rd, result)
+   return llStreamOpenStdIn(llReadFromStdin)
 
-proc on_compile_error(conf: ConfigRef; info: TLineInfo; msg: string; severity: Severity) {.gcsafe.} =
-   {.gcsafe.}:
-      if severity == Error and conf.m.errorOutputs.len != 0:
-         if last_line_is_import:
-            # 出现import错误，一般需要reset虚拟机环境，否则会出各自异常
-            # 这里不能直接抛出Reset异常，因为我们还需要输出异常信息
-            last_line_need_reset = true
+proc get_compile_error_handler(ctx: RunContext): ErrorHook =
+   proc on_compile_error(conf: ConfigRef; info: TLineInfo; msg: string; severity: Severity) {.gcsafe.} =
+      {.gcsafe.}:
+         if severity == Error and conf.m.errorOutputs.len != 0:
+            if ctx.last_line_is_import:
+               # 出现import错误，一般需要reset虚拟机环境，否则会出各自异常
+               # 这里先不能直接抛出Reset异常，因为我们还需要输出异常信息
+               ctx.last_line_need_reset = true
 
-            if conf.errorCounter - cur_error_count >= max_compiler_errors:
-               with_color(fgRed, false):
-                  echo "Too many error occured, skip..."
+               if conf.errorCounter >= ctx.max_compiler_errors:
+                  with_color(fgRed, false):
+                     echo "Too many error occured, skip..."
 
-               # 这里可以直接抛出异常了, 不需要屏蔽输出了
-               raise Reset()
-         else:
-            last_line_has_error = true
+                  # 这里可以直接抛出异常了, 不需要屏蔽输出了
+                  raise Reset()
+            else:
+               ctx.last_line_has_error = true
+
+   return on_compile_error
 
 proc interactivePasses(graph: ModuleGraph) =
    initDefines(graph.config.symbols)
@@ -496,11 +490,10 @@ proc interactivePasses(graph: ModuleGraph) =
 proc now(): string = times.now().format("HH:mm:ss")
 proc today(): string = times.now().format("yyyy-MM-dd")
 
-proc run_repl*(r: TLLRepl, libpath: string, libs: openArray[string], imports: seq[string]) =
-   var conf = newConfigRef()
+proc run_repl*(ctx: RunContext, libpath: string, libs: openArray[string], imports: seq[string]) =
+   var conf = ctx.conf
    var cache = newIdentCache()
    var graph = newModuleGraph(cache, conf)
-   cur_graph = graph
 
    conf.searchPaths.add libpath.AbsoluteDir
    for p in libs:
@@ -515,30 +508,32 @@ proc run_repl*(r: TLLRepl, libpath: string, libs: openArray[string], imports: se
    conf.globalOptions.excl {optTinyRtti, optOwnedRefs, optSeqDestructors}
    conf.features.incl vmopsDanger
 
+   conf.symbolFiles = disabledSf
+   conf.selectedGC = gcUnselected
+
    # 使用incremental compile cache, 目前看起来好像对模块加载速度没有多大提高
-   if using_ic_cache:
-      conf.symbolFiles = v2Sf
-      conf.cCompiler = ccNone
-      conf.selectedGC = gcUnselected
-      conf.options = {}
-      conf.globalOptions = {}
+   when false:
+      if opt_using_ic_cache.on:
+         conf.symbolFiles = v2Sf
+         conf.cCompiler = ccNone
+         conf.selectedGC = gcUnselected
+         conf.options = {}
+         conf.globalOptions = {}
 
    when hasFFI:
       conf.features.incl compiletimeFFI
 
-   conf.structuredErrorHook = on_compile_error
-   cur_conf = conf
+   conf.structuredErrorHook = get_compile_error_handler(ctx)
 
    interactivePasses(graph)
-   var m = graph.makeStdinModule()
+   var m = graph.makeModule(AbsoluteFile"script")
    incl(m.flags, sfMainModule)
-   cur_module = m
 
-   var idgen = idGeneratorFromModule(m)
-   var ctx = setupVM(m, cache, "stdin", graph, idgen)
+   var vm = setupVM(m, cache, "stdin", graph, idGeneratorFromModule(m))
+   graph.vm = vm
 
    when my_special_vmops:
-      ctx.vm_native:
+      vm.vm_native_proc:
          proc httpget(url: string): string
          proc httppost(url, body: string): string
          func make_console_codepage(s: string): string
@@ -546,13 +541,12 @@ proc run_repl*(r: TLLRepl, libpath: string, libs: openArray[string], imports: se
          func make_tchar(s: string): string
          func make_utf8(s: string): string
 
-   ctx.vm_native:
+   vm.vm_native_proc:
       func cpu_time(): float
       func epoch_time(): float
       proc now(): string
       proc today(): string
 
-   graph.vm = ctx
    graph.compileSystemModule()
 
    # 将注册的API作为一个模块自动import
@@ -571,38 +565,39 @@ proc run_repl*(r: TLLRepl, libpath: string, libs: openArray[string], imports: se
       var ok: bool
       let mf = findFile(conf, f & ".nim")
       if not mf.isEmpty:
-         last_line_is_import = true
-         last_line_need_reset = false
+         conf.errorCounter = 0
+         ctx.last_line_is_import = true
+         ctx.last_line_need_reset = false
          try:
             discard graph.compileModule(fileInfoIdx(conf, mf), {})
          except:
-            last_line_need_reset = true
+            ctx.last_line_need_reset = true
          finally:
-            if last_line_need_reset:
-               last_line_need_reset = false
-               add_failed_module(f, mf.string)
+            if ctx.last_line_need_reset:
+               ctx.last_line_need_reset = false
+               add_failed_module(ctx, f, mf.string)
                raise Reset()
 
-            ok = not last_line_need_reset
-            last_line_is_import = false
+            ok = not ctx.last_line_need_reset
+            ctx.last_line_is_import = false
       else:
          ok = false
       ok
 
-   if check_failed_module_time:
-      check_failed_module_time = false
-      refresh_failed_module_with_last_mod_time()
+   if opt_check_failed_module_time.on:
+      ctx.options.excl opt_check_failed_module_time
+      refresh_failed_module_with_last_mod_time(ctx)
 
    var pre_compile_module: seq[string]
 
    # 预编译这些模块，这样在出现异常重新加载的时候，就不需要重新解析了
    const pre_load_module = @["strutils", "strformat", "os", "tables", "sets", "math", "json", "macros"]
    for f in pre_load_module & imports:
-      if not is_failed_module(f) and tryCompile(f):
+      if not is_failed_module(ctx, f) and tryCompile(f):
          pre_compile_module.add f
 
    # 缺省import的模块
-   pre_load_code = "import " & pre_compile_module.join(",") & "\p"
+   ctx.pre_load_code = "import " & pre_compile_module.join(",") & "\p"
 
    # 存在3种类型的出错：
    # 1. 输入代码语法错，一般不需要额外操作，只是把错误的代码忽略就可以
@@ -610,9 +605,9 @@ proc run_repl*(r: TLLRepl, libpath: string, libs: openArray[string], imports: se
    # 3. 如果输入import times这种，可能会破坏整个vm，这个时候需要重建整个环境，就是reset
    while true:
       try:
-         last_line_need_reset = false
-         last_line_has_error = false
-         processModule(graph, m, idgen, llStreamOpenStdIn(r))
+         ctx.last_line_need_reset = false
+         ctx.last_line_has_error = false
+         processModule(graph, m, vm.idgen, get_ll_stream(ctx))
       except ResetError:
          break
       except ReloadError:
@@ -625,7 +620,7 @@ proc run_repl*(r: TLLRepl, libpath: string, libs: openArray[string], imports: se
             stdout.write("Error: ")
          echo getCurrentExceptionMsg()
 
-         if exception_to_reset_module:
+         if opt_exception_to_reset_module.on:
             break
 
 proc ctrl_c_proc*() {.noconv.} =
@@ -662,16 +657,17 @@ proc main() =
    for p in walkDir(pkg_dir):
       libs.add p.path
 
-   let imports = args.filterIt(not it.startsWith("-"))
+   var ctx = RunContext(max_compiler_errors: 10)
    if args.anyIt(it.startsWith("-cache") or it.startsWith("--cache")):
-      save_nims_code = true
-      input_lines_good = load_nims_cache_file()
+      ctx.options.incl opt_save_nims_code
+      ctx.input_lines_good = load_nims_cache_file()
 
+   let imports = args.filterIt(not it.startsWith("-"))
    set_control_chook(ctrl_c_proc)
    while true:
       try:
-         restart_eval = true
-         run_repl(llReadFromStdin, nimlib, libs, imports)
+         ctx.conf = newConfigRef()
+         run_repl(ctx, nimlib, libs, imports)
       except:
          discard
 
