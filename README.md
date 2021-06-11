@@ -1,5 +1,5 @@
 # nims
-simple nim nrpl
+simple nim repl
 
 This is enhanced version of "nim secret".
 
