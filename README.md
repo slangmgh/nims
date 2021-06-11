@@ -15,4 +15,4 @@ Feature list:
 5.  Input script auto indent.
 6.  Multi-line code paste should work.
 7.  With "-cache" option, input script can be auto save/load.
-8.  You can add native callback function with vm_native macro easily.
+8.  You can add native callback function with vm_native_proc macro easily.
