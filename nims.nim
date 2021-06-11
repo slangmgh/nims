@@ -469,28 +469,6 @@ proc setup_input_stream(ctx: RunContext) =
 
    ctx.input_stream = llStreamOpenStdIn(llReadFromStdin)
 
-proc setup_config_error_hook(ctx: RunContext) =
-   proc on_compile_error(conf: ConfigRef; info: TLineInfo; msg: string; severity: Severity) {.gcsafe.} =
-      if severity == Error and conf.m.errorOutputs.len != 0:
-         if ctx.last_line_is_import:
-            # 出现import错误，一般需要reset虚拟机环境，否则会出各自异常
-            # 这里先不能直接抛出Reset异常，因为我们还需要输出异常信息
-            ctx.last_line_need_reset = true
-
-            if conf.errorCounter >= ctx.max_compiler_errors:
-               with_color(fgRed, false):
-                  echo "Too many error occured, skip..."
-
-               # 这里可以直接抛出异常了, 不需要屏蔽输出了
-               raise Reset()
-         else:
-            ctx.last_line_has_error = true
-
-   ctx.conf.structuredErrorHook = on_compile_error
-
-proc now(): string = times.now().format("HH:mm:ss")
-proc today(): string = times.now().format("yyyy-MM-dd")
-
 proc safe_compile_module(graph: ModuleGraph, ctx: RunContext, mf: AbsoluteFile): bool =
    var
       conf = ctx.conf
@@ -514,9 +492,31 @@ proc safe_compile_module(graph: ModuleGraph, ctx: RunContext, mf: AbsoluteFile):
 
    success
 
-proc register_my_vmops(vm: PEvalContext, ctx: RunContext, graph: ModuleGraph) =
+proc setup_config_error_hook(ctx: RunContext) =
+   proc on_compile_error(conf: ConfigRef; info: TLineInfo; msg: string; severity: Severity) {.gcsafe.} =
+      if severity == Error and conf.m.errorOutputs.len != 0:
+         if ctx.last_line_is_import:
+            # 出现import错误，一般需要reset虚拟机环境，否则会出各自异常
+            # 这里先不能直接抛出Reset异常，因为我们还需要输出异常信息
+            ctx.last_line_need_reset = true
+
+            if conf.errorCounter >= ctx.max_compiler_errors:
+               with_color(fgRed, false):
+                  echo "Too many error occured, skip..."
+
+               # 这里可以直接抛出异常了, 不需要屏蔽输出了
+               raise Reset()
+         else:
+            ctx.last_line_has_error = true
+
+   ctx.conf.structuredErrorHook = on_compile_error
+
+proc register_custom_vmops(vm: PEvalContext, ctx: RunContext, graph: ModuleGraph) =
    var
       conf = ctx.conf
+
+   proc now(): string = times.now().format("HH:mm:ss")
+   proc today(): string = times.now().format("yyyy-MM-dd")
 
    vm.vm_native_proc:
       func cpu_time(): float
@@ -595,7 +595,7 @@ proc setup_vm_config(ctx: RunContext, conf: ConfigRef) =
 
    setup_vm_config_define(conf)
 
-proc setup_script_main_module(graph: ModuleGraph): PCtx =
+proc create_script_vm(graph: ModuleGraph): PCtx =
    var m = graph.makeModule(AbsoluteFile"script")
    incl(m.flags, sfMainModule)
 
@@ -641,8 +641,8 @@ proc setup_vm_environment(ctx: RunContext, graph: ModuleGraph) =
    setup_config_error_hook(ctx)
    setup_interactive_passes(graph)
 
-   var vm = setup_script_main_module(graph)
-   vm.register_my_vmops(ctx, graph)
+   var vm = create_script_vm(graph)
+   vm.register_custom_vmops(ctx, graph)
    load_preload_module(ctx, graph)
 
 proc run_repl(ctx: RunContext) =
