@@ -411,8 +411,9 @@ proc get_line(ctx: RunContext): string =
          # 就发送一条无关紧要的语句，修正输出
          # 比如输入 &"{\"xx"}" 就会导致下一条语句没有输出（如果没有下面的语句的话）
          # 不过好像现在又正常了，先不用吧
+         # 有时还是不正常了，还是加上吧
 
-         when false:
+         when true:
             ctx.last_input_line = ""
             disable_output(ctx.conf)
             return "echo \" \""
@@ -458,21 +459,20 @@ proc get_ll_stream(ctx: RunContext): PLLStream =
 
 proc get_compile_error_handler(ctx: RunContext): ErrorHook =
    proc on_compile_error(conf: ConfigRef; info: TLineInfo; msg: string; severity: Severity) {.gcsafe.} =
-      {.gcsafe.}:
-         if severity == Error and conf.m.errorOutputs.len != 0:
-            if ctx.last_line_is_import:
-               # 出现import错误，一般需要reset虚拟机环境，否则会出各自异常
-               # 这里先不能直接抛出Reset异常，因为我们还需要输出异常信息
-               ctx.last_line_need_reset = true
+      if severity == Error and conf.m.errorOutputs.len != 0:
+         if ctx.last_line_is_import:
+            # 出现import错误，一般需要reset虚拟机环境，否则会出各自异常
+            # 这里先不能直接抛出Reset异常，因为我们还需要输出异常信息
+            ctx.last_line_need_reset = true
 
-               if conf.errorCounter >= ctx.max_compiler_errors:
-                  with_color(fgRed, false):
-                     echo "Too many error occured, skip..."
+            if conf.errorCounter >= ctx.max_compiler_errors:
+               with_color(fgRed, false):
+                  echo "Too many error occured, skip..."
 
-                  # 这里可以直接抛出异常了, 不需要屏蔽输出了
-                  raise Reset()
-            else:
-               ctx.last_line_has_error = true
+               # 这里可以直接抛出异常了, 不需要屏蔽输出了
+               raise Reset()
+         else:
+            ctx.last_line_has_error = true
 
    return on_compile_error
 
@@ -491,6 +491,28 @@ proc interactivePasses(graph: ModuleGraph) =
 
 proc now(): string = times.now().format("HH:mm:ss")
 proc today(): string = times.now().format("yyyy-MM-dd")
+
+proc safe_compile_module(ctx: RunContext, graph: ModuleGraph, mf: AbsoluteFile): bool =
+   var
+      conf = ctx.conf
+      success = true
+
+   proc on_compile_error(conf: ConfigRef; info: TLineInfo; msg: string; severity: Severity) {.gcsafe.} =
+      if severity == Error and conf.m.errorOutputs.len != 0:
+         success = false
+         if conf.errorCounter >= ctx.max_compiler_errors:
+            raise Reset()
+
+   conf.errorCounter = 0
+   conf.structuredErrorHook = on_compile_error
+   try:
+      discard graph.compileModule(fileInfoIdx(conf, mf), {})
+   except:
+      success = false
+   finally:
+      conf.structuredErrorHook = nil
+
+   success
 
 proc run_repl*(ctx: RunContext, libpath: string, libs: openArray[string], imports: seq[string]) =
    var conf = ctx.conf
@@ -524,8 +546,6 @@ proc run_repl*(ctx: RunContext, libpath: string, libs: openArray[string], import
 
    when hasFFI:
       conf.features.incl compiletimeFFI
-
-   conf.structuredErrorHook = get_compile_error_handler(ctx)
 
    interactivePasses(graph)
    var m = graph.makeModule(AbsoluteFile"script")
@@ -563,29 +583,6 @@ proc run_repl*(ctx: RunContext, libpath: string, libs: openArray[string], import
       conf.implicitImports.add sf
       discard graph.compileModule(fileInfoIdx(conf, AbsoluteFile sf), {})
 
-   template tryCompile(f: string): bool =
-      var ok: bool
-      let mf = findFile(conf, f & ".nim")
-      if not mf.isEmpty:
-         conf.errorCounter = 0
-         ctx.last_line_is_import = true
-         ctx.last_line_need_reset = false
-         try:
-            discard graph.compileModule(fileInfoIdx(conf, mf), {})
-         except:
-            ctx.last_line_need_reset = true
-         finally:
-            if ctx.last_line_need_reset:
-               ctx.last_line_need_reset = false
-               add_failed_module(ctx, f, mf.string)
-               raise Reset()
-
-            ok = not ctx.last_line_need_reset
-            ctx.last_line_is_import = false
-      else:
-         ok = false
-      ok
-
    if opt_check_failed_module_time.on:
       ctx.options.excl opt_check_failed_module_time
       refresh_failed_module_with_last_mod_time(ctx)
@@ -593,13 +590,24 @@ proc run_repl*(ctx: RunContext, libpath: string, libs: openArray[string], import
    var pre_compile_module: seq[string]
 
    # 预编译这些模块，这样在出现异常重新加载的时候，就不需要重新解析了
-   const pre_load_module = @["strutils", "strformat", "os", "tables", "sets", "math", "json", "macros"]
+   var pre_load_module = @["strutils", "strformat", "os", "tables", "sets", "math", "json", "macros"]
+   when not my_special_vmops:
+      pre_load_module.add "sequtils"
+
    for f in pre_load_module & imports:
-      if not is_failed_module(ctx, f) and tryCompile(f):
-         pre_compile_module.add f
+      if not is_failed_module(ctx, f):
+         let mf = findFile(conf, f & ".nim")
+         if not mf.isEmpty:
+            if not safe_compile_module(ctx, graph, mf):
+               add_failed_module(ctx, f, mf.string)
+               raise Reset()
+            else:
+               pre_compile_module.add f
 
    # 缺省import的模块
    ctx.pre_load_code = "import " & pre_compile_module.join(",") & "\p"
+
+   conf.structuredErrorHook = get_compile_error_handler(ctx)
 
    # 存在3种类型的出错：
    # 1. 输入代码语法错，一般不需要额外操作，只是把错误的代码忽略就可以
