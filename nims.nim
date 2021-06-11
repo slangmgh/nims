@@ -37,6 +37,7 @@ type
       opt_no_preload_module
       opt_paste_mode
       opt_exception_to_reset_module
+      opt_import_error_to_reset_module
       opt_error_to_reload_code
       opt_check_failed_module_time
       opt_using_ic_cache
@@ -50,6 +51,7 @@ type
       libpath: string
       libs: seq[string]
       imports: seq[string]
+      scriptapi_import: string
 
       options: set[RunOption]
       max_compiler_errors: int
@@ -69,6 +71,8 @@ proc init(ctx: RunContext) =
    ctx.last_line_has_error = false
    ctx.last_line_is_import = false
    ctx.last_input_line = ""
+   if not ctx.input_stream.isNil:
+      ctx.input_stream.lineOffset = -1
 
 template on(o: RunOption): bool = o in ctx.options
 
@@ -245,31 +249,23 @@ proc my_read_line(ctx: RunContext): string =
       of "paste", "p":
          ctx.toggle_option(opt_paste_mode)
          with_color(fgCyan, false):
-            echo "Paste mode is " & opt_paste_mode.onoff
-      of "exceptmode", "xm", "except":
-         ctx.toggle_option(opt_exception_to_reset_module)
-         with_color(fgCyan, false):
-            echo "Exception reset mode is " & opt_exception_to_reset_module.onoff
+            echo "Paste mode is(p) " & opt_paste_mode.onoff
       of "ic", "iccache":
          when false:
             ctx.toggle_option(opt_using_ic_cache)
             with_color(fgCyan, false):
                echo "Using incremental cache is " & opt_using_ic_cache.onoff
-      of "errormode", "em", "error":
-         ctx.toggle_option(opt_error_to_reload_code)
-         with_color(fgCyan, false):
-            echo "Error reload mode is " & opt_error_to_reload_code.onoff
       of "savecode", "sc", "cache":
          ctx.toggle_option(opt_save_nims_code)
          with_color(fgCyan, false):
-            echo "Save nims code is " & opt_save_nims_code.onoff
+            echo "Save nims code is(sc) " & opt_save_nims_code.onoff
       of "show", "s":
          show_raw_buffer(ctx.input_lines_good.join(""), "Current buffer")
       of "maxerrors", "me":
          if cmds.len > 1:
             ctx.max_compiler_errors = argn(1, 10)
          with_color(fgCyan, false):
-            echo "Max compiler errors is " & $ctx.max_compiler_errors
+            echo "Max compiler errors is(me) " & $ctx.max_compiler_errors
       of "clean", "clear", "c":
          if ctx.input_lines_good.len > 0:
             let clear_line_count = argn(1, -1)
@@ -305,12 +301,26 @@ proc my_read_line(ctx: RunContext): string =
       of "load", "ll":
          ctx.input_lines_good = load_nims_cache_file()
          raise Reload()
+      of "errormode", "sem", "error":
+         ctx.toggle_option(opt_error_to_reload_code)
+         with_color(fgCyan, false):
+            echo "Syntax error to reload mode is(sem) " & opt_error_to_reload_code.onoff
+      of "exceptmode", "eem", "except":
+         ctx.toggle_option(opt_exception_to_reset_module)
+         with_color(fgCyan, false):
+            echo "Exception error to reset mode is(eem) " & opt_exception_to_reset_module.onoff
+      of "importerrormode", "iem":
+         ctx.toggle_option(opt_import_error_to_reset_module)
+         with_color(fgCyan, false):
+            echo "Import error to reset mode is(iem) " & opt_import_error_to_reset_module.onoff
       of "options", "option", "o":
          with_color(fgCyan, false):
-            echo "Exception reset mode is " & opt_exception_to_reset_module.onoff
-            echo "Error reload mode is " & opt_error_to_reload_code.onoff
-            echo "Save nims code is " & opt_save_nims_code.onoff
-            echo "Paste mode is " & opt_paste_mode.onoff
+            echo "Syntax error to reload mode is(sem) " & opt_error_to_reload_code.onoff
+            echo "Exception error to reset mode is(eem) " & opt_exception_to_reset_module.onoff
+            echo "Import error to reset mode is(iem) " & opt_import_error_to_reset_module.onoff
+            echo "Save nims code is(sc) " & opt_save_nims_code.onoff
+            echo "Paste mode is(p) " & opt_paste_mode.onoff
+            echo "Max compiler errors is(me) " & $ctx.max_compiler_errors
             when false:
                echo "Using incremental cache is " & opt_using_ic_cache.onoff
             # echo "Verbose mode is " & opt_verbose.onoff
@@ -410,7 +420,11 @@ proc get_line(ctx: RunContext): string =
    if ctx.last_line_need_reset:
       # 出现代码错误，抛出异常后重置环境
       ctx.last_line_need_reset = false
-      raise Reset()
+
+      if opt_import_error_to_reset_module.on:
+         raise Reset()
+      else:
+         raise Reload()
 
    if ctx.last_line_has_error:
       ctx.last_line_has_error = false
@@ -451,8 +465,8 @@ proc setup_input_stream(ctx: RunContext) =
          ctx.last_input_line = ""
 
          # 初始化import代码，不做任何输出
-         disable_output(ctx.conf)
          s.s = ctx.pre_load_code & ctx.input_lines_good.join("")
+         disable_output(ctx.conf)
       else:
          s.s = get_line(ctx)
 
@@ -505,7 +519,10 @@ proc setup_config_error_hook(ctx: RunContext) =
                   echo "Too many error occured, skip..."
 
                # 这里可以直接抛出异常了, 不需要屏蔽输出了
-               raise Reset()
+               if opt_import_error_to_reset_module.on:
+                  raise Reset()
+               else:
+                  raise Reload()
          else:
             ctx.last_line_has_error = true
 
@@ -542,6 +559,7 @@ proc register_custom_vmops(vm: PEvalContext, ctx: RunContext, graph: ModuleGraph
       let file = open(sf, fmWrite)
       file.write(native_import_procs_def)
       file.close
+      ctx.scriptapi_import = sf.changeFileExt("")
 
    conf.implicitImports.add sf
    discard graph.safe_compile_module(ctx, AbsoluteFile sf)
@@ -629,6 +647,9 @@ proc load_preload_module(ctx: RunContext, graph: ModuleGraph) =
             else:
                pre_compile_module.add f
 
+   if ctx.scriptapi_import != "":
+      pre_compile_module.add ctx.scriptapi_import
+
    # 缺省import的模块
    if pre_compile_module.len > 0:
       ctx.pre_load_code = "import " & pre_compile_module.join(",") & "\p"
@@ -663,8 +684,12 @@ proc run_repl(ctx: RunContext) =
       except ReloadError:
          discard
       except NilAccessDefect:
-         # 出现 nil 异常，我们还是Reset吧
-         break
+         with_color(fgRed, false):
+            stdout.write("Error: ")
+         echo getCurrentExceptionMsg()
+
+         if opt_exception_to_reset_module.on:
+            break
       except:
          with_color(fgRed, false):
             stdout.write("Error: ")
@@ -679,8 +704,8 @@ proc ctrl_c_proc() {.noconv.} =
 proc main() =
    var nimlib = ""
 
-   let args = commandLineParams()
-   let libs_arg = args.filterIt(it.startsWith("--lib:") or it.startsWith("-lib:"))
+   let args = commandLineParams().mapIt((if it[0] == '-' and it.len >= 3 and it[1] != '-': "-" & it else: it))
+   let libs_arg = args.filterIt(it.startsWith("--lib:"))
    if libs_arg.len > 0:
       for arg in libs_arg:
          var s = arg.split(':')[1]
@@ -708,12 +733,21 @@ proc main() =
       libs.add p.path
 
    var ctx = RunContext(max_compiler_errors: 10, libpath: nimlib, libs: libs)
-   if args.anyIt(it.startsWith("-cache") or it.startsWith("--cache")):
+   if args.anyIt(it.startsWith("--cache")):
       ctx.options.incl opt_save_nims_code
       ctx.input_lines_good = load_nims_cache_file()
 
-   if args.anyIt(it.startsWith("-no-preload-module") or it.startsWith("--no-preload-module")):
+   if args.anyIt(it.startsWith("--no-preload-module")):
       ctx.options.incl opt_no_preload_module
+
+   if args.anyIt(it.startsWith("--import-error-to-reset")):
+      ctx.options.incl opt_import_error_to_reset_module
+
+   if args.anyIt(it.startsWith("--exception-to-reset")):
+      ctx.options.incl opt_exception_to_reset_module
+
+   if args.anyIt(it.startsWith("--error-to-reload")):
+      ctx.options.incl opt_error_to_reload_code
 
    ctx.imports = args.filterIt(not it.startsWith("-"))
    set_control_chook(ctrl_c_proc)
