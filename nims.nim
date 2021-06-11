@@ -517,6 +517,38 @@ proc safe_compile_module(graph: ModuleGraph, ctx: RunContext, mf: AbsoluteFile):
 
    success
 
+proc register_my_vmops(vm: PEvalContext, graph: ModuleGraph, ctx: RunContext) =
+   var
+      conf = ctx.conf
+
+   vm.vm_native_proc:
+      func cpu_time(): float
+      func epoch_time(): float
+      proc now(): string
+      proc today(): string
+
+   when my_special_vmops:
+      vm.vm_native_proc:
+         proc httpget(url: string): string
+         proc httppost(url, body: string): string
+         func make_console_codepage(s: string): string
+         func make_gb(s: string): string
+         func make_tchar(s: string): string
+         func make_utf8(s: string): string
+
+   graph.compileSystemModule()
+
+   # 将注册的API作为一个模块自动import
+   const native_import_procs_def = native_import_procs
+   let sf = getTempDir() / "scriptapi.nim"
+   block:
+      let file = open(sf, fmWrite)
+      file.write(native_import_procs_def)
+      file.close
+
+   conf.implicitImports.add sf
+   discard graph.safe_compile_module(ctx, AbsoluteFile sf)
+
 proc run_repl*(ctx: RunContext, libpath: string, libs: openArray[string], imports: seq[string]) =
    var conf = ctx.conf
    var cache = newIdentCache()
@@ -557,38 +589,11 @@ proc run_repl*(ctx: RunContext, libpath: string, libs: openArray[string], import
    var vm = setupVM(m, cache, "stdin", graph, idGeneratorFromModule(m))
    graph.vm = vm
 
-   when my_special_vmops:
-      vm.vm_native_proc:
-         proc httpget(url: string): string
-         proc httppost(url, body: string): string
-         func make_console_codepage(s: string): string
-         func make_gb(s: string): string
-         func make_tchar(s: string): string
-         func make_utf8(s: string): string
-
-   vm.vm_native_proc:
-      func cpu_time(): float
-      func epoch_time(): float
-      proc now(): string
-      proc today(): string
-
-   graph.compileSystemModule()
-
-   # 将注册的API作为一个模块自动import
-   when my_special_vmops:
-      const native_import_procs_def = native_import_procs
-      let sf = getTempDir() / "scriptapi.nim"
-      block:
-         let file = open(sf, fmWrite)
-         file.write(native_import_procs_def)
-         file.close
-
-      conf.implicitImports.add sf
-      discard graph.safe_compile_module(ctx, AbsoluteFile sf)
+   vm.register_my_vmops(graph, ctx)
 
    if opt_check_failed_module_time.on:
       ctx.options.excl opt_check_failed_module_time
-      refresh_failed_module_with_last_mod_time(ctx)
+      ctx.refresh_failed_module_with_last_mod_time()
 
    var pre_compile_module: seq[string]
 
@@ -602,7 +607,7 @@ proc run_repl*(ctx: RunContext, libpath: string, libs: openArray[string], import
          let mf = findFile(conf, f & ".nim")
          if not mf.isEmpty:
             if not graph.safe_compile_module(ctx, mf):
-               add_failed_module(ctx, f, mf.string)
+               ctx.add_failed_module(f, mf.string)
                raise Reset()
             else:
                pre_compile_module.add f
@@ -620,7 +625,7 @@ proc run_repl*(ctx: RunContext, libpath: string, libs: openArray[string], import
       try:
          ctx.last_line_need_reset = false
          ctx.last_line_has_error = false
-         processModule(graph, m, vm.idgen, get_ll_stream(ctx))
+         graph.processModule(m, vm.idgen, get_ll_stream(ctx))
       except ResetError:
          break
       except ReloadError:
