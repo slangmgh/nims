@@ -142,7 +142,7 @@ proc disable_stdout() =
    discard reopen(stdout, device, fmWrite)
 
 proc enable_stdout() =
-   const device = when defined(windows): "CON" else: "/dev/console"
+   const device = when defined(windows): "CON" else: "/dev/tty"
    discard reopen(stdout, device, fmWrite)
 
 proc get_prompt(indent_level, line_no: int): string =
@@ -219,7 +219,6 @@ proc my_read_line(ctx: RunContext): string =
             echo ":show   [\\s]: Show the current code."
             echo ":paste  [\\p]: Enable/Disable the paste mode."
             echo ":except [\\e]: Enable/Disable the except to reset mode."
-            echo ":ic     [\\ic]:Enable/Disable the incremental cache."
             echo ":option [\\o]: Show current options."
             echo ":reset  [\\r]: Reset the vm to init state."
             echo ":exit   [\\q]: Exit the program."
@@ -320,7 +319,7 @@ proc my_read_line(ctx: RunContext): string =
          raise Reset()
       else:
          with_color(fgRed, false):
-            echo "Unknown command [$#]." % cmds[0]
+            echo &"Unknown command {cmds[0]}."
 
    var
       buffer = ""
@@ -431,7 +430,7 @@ proc get_line(ctx: RunContext): string =
 
 proc get_ll_stream(ctx: RunContext): PLLStream =
    proc llReadFromStdin(s: PLLStream, buf: pointer, bufLen: int): int =
-      # 确保输出正常
+      # Ensure the output is fine
       enable_output(ctx.conf)
 
       s.rd = 0
@@ -480,19 +479,23 @@ proc interactivePasses(graph: ModuleGraph) =
    initDefines(graph.config.symbols)
    defineSymbol(graph.config.symbols, "nimconfig")
    defineSymbol(graph.config.symbols, "nimscript")
+
    when hasFFI:
       defineSymbol(graph.config.symbols, "nimffi")
       defineSymbol(graph.config.symbols, "nimHasLibFFI")
+
    when my_special_vmops:
       defineSymbol(graph.config.symbols, "nimVmops")
+
    undefSymbol(graph.config.symbols, "nimv2")
+
    registerPass(graph, semPass)
    registerPass(graph, evalPass)
 
 proc now(): string = times.now().format("HH:mm:ss")
 proc today(): string = times.now().format("yyyy-MM-dd")
 
-proc safe_compile_module(ctx: RunContext, graph: ModuleGraph, mf: AbsoluteFile): bool =
+proc safe_compile_module(graph: ModuleGraph, ctx: RunContext, mf: AbsoluteFile): bool =
    var
       conf = ctx.conf
       success = true
@@ -581,7 +584,7 @@ proc run_repl*(ctx: RunContext, libpath: string, libs: openArray[string], import
          file.close
 
       conf.implicitImports.add sf
-      discard graph.compileModule(fileInfoIdx(conf, AbsoluteFile sf), {})
+      discard graph.safe_compile_module(ctx, AbsoluteFile sf)
 
    if opt_check_failed_module_time.on:
       ctx.options.excl opt_check_failed_module_time
@@ -598,7 +601,7 @@ proc run_repl*(ctx: RunContext, libpath: string, libs: openArray[string], import
       if not is_failed_module(ctx, f):
          let mf = findFile(conf, f & ".nim")
          if not mf.isEmpty:
-            if not safe_compile_module(ctx, graph, mf):
+            if not graph.safe_compile_module(ctx, mf):
                add_failed_module(ctx, f, mf.string)
                raise Reset()
             else:
