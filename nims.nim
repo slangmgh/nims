@@ -14,6 +14,8 @@ import "../../compiler" / [ast, astalgo, modules, passes, condsyms,
        options, sem, semdata, llstream, vm, vmdef, nimeval, lineinfos, msgs,
        modulegraphs, idents, pathutils, passaux, scriptconfig, parser]
 
+# import segfaults so we can catch NilAccessDefect
+# rather than crash the program and quit
 import segfaults
 
 const my_special_vmops = defined(myvmops)
@@ -223,9 +225,15 @@ proc print_loaded_module(graph: ModuleGraph) =
          let f = toFullPath(conf, FileIndex i)
          echo &"idx: {i}, name: {f}"
 
-proc print_module_sym(graph: ModuleGraph, m: PSym) =
+proc print_module_export_syms(graph: ModuleGraph, m: PSym) =
    for s in allSyms(graph, m):
       echo s
+
+proc print_module_syms(graph: ModuleGraph, m: PSym) =
+   let interf = semtabAll(graph, m)
+   echo "Symbol counts:", interf.counter
+   for s in interf:
+      echo s.name[]
 
 proc print_vm_globals(graph: ModuleGraph) =
    let c = PCtx graph.vm
@@ -233,7 +241,16 @@ proc print_vm_globals(graph: ModuleGraph) =
    let xlen = c.globals.len
    if xlen > 0:
       for i in 0..xlen-1:
-         echo c.globals[i][]
+         let n = c.globals[i][]
+         echo n.info.line, n
+
+proc is_var_exists(graph: ModuleGraph, m: PSym, name: string): bool =
+   let interf = semtabAll(graph, m)
+   for s in interf:
+      if s.name.s == name:
+         return true
+
+   return false
 
 ## paste mode
 ## don't do any indent, add the code directly
@@ -278,7 +295,6 @@ proc my_read_line(ctx: RunContext): string =
          quit()
       of "verbose", "debug", "v", "d":
          ctx.toggle_option(opt_verbose)
-         setForegroundColor(fgCyan)
          with_color(fgCyan, false):
             echo "Debug mode is " & opt_verbose.onoff
       of "paste", "p":
@@ -333,9 +349,6 @@ proc my_read_line(ctx: RunContext): string =
 
                   if opt_save_nims_code.on:
                      save_nims_cache_file(ctx.input_lines_good)
-      of "load", "ll":
-         ctx.input_lines_good = load_nims_cache_file()
-         raise Reload()
       of "error-mode", "sem", "error":
          ctx.toggle_option(opt_error_to_reload_code)
          with_color(fgCyan, false):
@@ -355,10 +368,13 @@ proc my_read_line(ctx: RunContext): string =
             echo "Import error to reset mode is(iem) " & opt_import_error_to_reset_module.onoff
             echo "Save nims code is(sc) " & opt_save_nims_code.onoff
             echo "Paste mode is(p) " & opt_paste_mode.onoff
-            echo "Max compiler errors is(me) " & $ctx.max_compiler_errors
             echo "Verbose mode is " & opt_verbose.onoff
+            echo "Max compiler errors is(me) " & $ctx.max_compiler_errors
             when false:
                echo "Using incremental cache is " & opt_using_ic_cache.onoff
+      of "load", "ll":
+         ctx.input_lines_good = load_nims_cache_file()
+         raise Reload()
       of "reload", "rr":
          raise Reload()
       of "reset", "r", "rs", "rb":
@@ -378,14 +394,14 @@ proc my_read_line(ctx: RunContext): string =
       of "print-loaded-module":
          with_color(fgCyan, false):
             print_loaded_module(ctx.graph)
-      of "print-module-sym":
+      of "print-module-syms":
          let idx = argn(1, 0)
          if idx >= ctx.graph.ifaces.len:
             with_color(fgCyan, false):
                echo "Max module number is: ", ctx.graph.ifaces.len - 1
          else:
             with_color(fgCyan, false):
-               print_module_sym(ctx.graph, getModule(ctx.graph, FileIndex idx))
+               print_module_syms(ctx.graph, getModule(ctx.graph, FileIndex idx))
       of "print-vm-globals":
          with_color(fgCyan, false):
             print_vm_globals(ctx.graph)
@@ -581,6 +597,18 @@ proc compile_import_module(ctx: RunContext) =
    else:
       ctx.last_input_line = ""
 
+proc check_var_set_value(ctx: RunContext): bool =
+   # var a = 1; var a = 2; echo a; will output 1
+   # so we need remove "var " from the second statement
+   if ctx.last_input_line.startsWith("var ") or ctx.last_input_line.startsWith("let "):
+      if ctx.last_input_line.find('=') >= 0:
+         let vars = ctx.last_input_line[4..^1].split('=')[0].split(',').mapIt(it.strip.split(':')[0])
+         for v in vars:
+            if is_var_exists(ctx.graph, ctx.main_module, v):
+               ctx.last_input_line = ctx.last_input_line[4..^1].strip(trailing = false)
+               return true
+   return false
+
 proc setup_input_stream(ctx: RunContext) =
    proc llReadFromStdin(s: PLLStream, buf: pointer, bufLen: int): int =
       # Ensure the output is fine
@@ -607,6 +635,8 @@ proc setup_input_stream(ctx: RunContext) =
          ctx.last_line_is_import = ctx.last_input_line.is_import_line
          if ctx.last_line_is_import:
             compile_import_module(ctx)
+            s.s = ctx.last_input_line
+         elif check_var_set_value(ctx):
             s.s = ctx.last_input_line
 
       # set the lineOffset to 0, so the syntax error's line number will same
@@ -813,6 +843,7 @@ proc run_repl(ctx: RunContext) =
       except ResetError:
          break
       except ReloadError:
+         initStrTables(ctx.graph, ctx.main_module)
          discard
       except NilAccessDefect:
          with_color(fgRed, false):
