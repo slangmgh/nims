@@ -243,7 +243,7 @@ proc my_read_line(ctx: RunContext): string =
 
    template add_line() =
       if buffer == "":
-         buffer &= myline.strip(trailing = false)
+         buffer &= myline.strip(trailing = false) & "\p"
       else:
          buffer &= myline & "\p"
       inc(line_no)
