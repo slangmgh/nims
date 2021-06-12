@@ -45,7 +45,9 @@ type
    ErrorHook = proc(config: ConfigRef; info: TLineInfo; msg: string; severity: Severity) {.closure, gcsafe.}
    RunContext = ref object
       conf: ConfigRef
+      graph: ModuleGraph
       main_module: PSym
+      idgen: IdGenerator
 
       input_stream: PLLStream
 
@@ -74,6 +76,16 @@ proc init(ctx: RunContext) =
    ctx.last_input_line = ""
    if not ctx.input_stream.isNil:
       ctx.input_stream.lineOffset = -1
+
+proc copy(ctx: RunContext): RunContext =
+   RunContext(
+      conf: newConfigRef(),
+      libpath: ctx.libpath,
+      libs: ctx.libs,
+      max_compiler_errors: ctx.max_compiler_errors,
+      failed_imports: ctx.failed_imports,
+      scriptapi_import: ctx.scriptapi_import
+   )
 
 template on(o: RunOption): bool = o in ctx.options
 
@@ -152,7 +164,6 @@ func is_all_space(line: string): bool =
    line == "" or line.allIt(it == ' ')
 
 func is_import_line(s: string): bool =
-   let s = s.strip
    s.startsWith("import ") or s.startsWith("from ") or s.startsWith("include ")
 
 proc disable_stdout() =
@@ -202,17 +213,25 @@ type ReloadError* = object of CatchableError
 template Reset(): untyped = newException(ResetError, "Reset the vm")
 template Reload(): untyped = newException(ReloadError, "Reload the code")
 
+proc print_loaded_module(graph: ModuleGraph) =
+   echo &"Total loaded module: {graph.ifaces.len}"
+
+   let xlen = graph.ifaces.len
+   if xlen >= 0:
+      var conf = graph.config
+      for i in 0..xlen-1:
+         let f = toFullPath(conf, FileIndex i)
+         echo &"idx: {i}, name: {f}"
+
 ## paste mode
-## 不做任何缩进和命令处理，直接把内容加上去
-## 切换成paste mode的方式：
-## 1. 用paste命令
-## 2. 当发现readLine调用时间特别短的时候
-## 3. 发现输入的行中有注释行，第一个字符为'#'的时候
+## don't do any indent, add the code directly
+## it is used to paste code to terminal
 ##
-## 正常模式
-## 做缩进和命令处理
-## 切换成正常模式的方式
-## 1. 用paste命令
+## paste mode is triggered at following situation:
+## 1. use :paste command
+## 2. When the readLine call take very small time, less than 0.08 seconds
+## 3. When the line has comment line, first char is '#'
+##
 
 proc my_read_line(ctx: RunContext): string =
    template args(n: int, s: string): string = (if cmds.len > n: cmds[n] else: s)
@@ -223,7 +242,10 @@ proc my_read_line(ctx: RunContext): string =
       else: v
 
    template add_line() =
-      buffer &= myline & "\p"
+      if buffer == "":
+         buffer &= myline.strip(trailing = false)
+      else:
+         buffer &= myline & "\p"
       inc(line_no)
 
    template onoff(v: RunOption): string = (if v in ctx.options: "on" else: "off")
@@ -264,7 +286,7 @@ proc my_read_line(ctx: RunContext): string =
          show_raw_buffer(ctx.input_lines_good.join(""), "Current buffer")
       of "maxerrors", "me":
          if cmds.len > 1:
-            ctx.max_compiler_errors = argn(1, 10)
+            ctx.max_compiler_errors = argn(1, ctx.max_compiler_errors)
          with_color(fgCyan, false):
             echo "Max compiler errors is(me) " & $ctx.max_compiler_errors
       of "clean", "clear", "c":
@@ -329,18 +351,22 @@ proc my_read_line(ctx: RunContext): string =
       of "reload", "rr":
          raise Reload()
       of "reset", "r", "rs", "rb":
-         if cmd == "rs":
+         if cmd == "rs": # Clear the input buffer before reset
             ctx.input_lines_good = @[]
             if opt_save_nims_code.on:
                save_nims_cache_file(ctx.input_lines_good)
 
-         if cmd == "rb":
+         if cmd == "rb": # Clear the failed import module before reset
             ctx.failed_imports = @[]
          else:
-            # 手工reset，需要检查编译失败的模块时候需要重新加载
+            # Reset vm manually，we need to check the modified time of failed module
+            # to see if it need reload
             ctx.options.incl opt_check_failed_module_time
 
          raise Reset()
+      of "print_loaded_module":
+         with_color(fgCyan, false):
+            print_loaded_module(ctx.graph)
       else:
          with_color(fgRed, false):
             echo &"Unknown command {cmds[0]}."
@@ -404,7 +430,6 @@ proc my_read_line(ctx: RunContext): string =
 
    return buffer
 
-# 在重新初始化的时候，会执行原来成功的代码，这时我们不需要输出
 proc my_msg_writeln_hook(msg: string) =
    discard
 
@@ -419,7 +444,12 @@ proc enable_output(conf: ConfigRef) =
 
 proc get_line(ctx: RunContext): string =
    if ctx.last_line_need_reset:
-      # 出现代码错误，抛出异常后重置环境
+      # When error on import, we need to reset the VM or reload the code
+      # according the config option.
+      #
+      # If we compile module before import, this code will never be
+      # triggered, because import always successful.
+
       ctx.last_line_need_reset = false
 
       if opt_import_error_to_reset_module.on:
@@ -434,16 +464,14 @@ proc get_line(ctx: RunContext): string =
       if opt_error_to_reload_code.on:
          raise Reload()
       else:
-         # 由于出现语法错误的时候，有时会导致下一次输出出现问题，所以
-         # 就发送一条无关紧要的语句，修正输出
-         # 比如输入 &"{\"xx"}" 就会导致下一条语句没有输出（如果没有下面的语句的话）
-         # 不过好像现在又正常了，先不用吧
-         # 有时还是不正常了，还是加上吧
+         # Some time syntax error will make the next line code doesn't output result,
+         # so we add an empty echo to fix this.
+         # For example, input &"{\"xx"}" will make the display disappear sometime, it
+         # not always true of cause.
 
-         when true:
-            ctx.last_input_line = ""
-            disable_output(ctx.conf)
-            return "echo \" \""
+         ctx.last_input_line = ""
+         disable_output(ctx.conf)
+         return "echo \" \""
 
    if ctx.last_input_line != "":
       if ctx.input_lines_good.len == 0 or ctx.input_lines_good[^1] != ctx.last_input_line:
@@ -452,37 +480,16 @@ proc get_line(ctx: RunContext): string =
             save_nims_cache_file(ctx.input_lines_good)
 
    ctx.last_input_line = my_read_line(ctx)
-   ctx.last_line_is_import = ctx.last_input_line.is_import_line
 
    return ctx.last_input_line
 
-proc setup_input_stream(ctx: RunContext) =
-   proc llReadFromStdin(s: PLLStream, buf: pointer, bufLen: int): int =
-      # Ensure the output is fine
-      enable_output(ctx.conf)
-
-      s.rd = 0
-      if s.lineOffset < 0:
-         ctx.last_input_line = ""
-
-         # 初始化import代码，不做任何输出
-         s.s = ctx.pre_load_code & ctx.input_lines_good.join("")
-         disable_output(ctx.conf)
-      else:
-         s.s = get_line(ctx)
-
-      # 执行前总是reset错误数
-      ctx.conf.errorCounter = 0
-
-      # 设置lineOffset为0, 以确保报错信息和显示行号一致
-      s.lineOffset = 0
-
-      result = min(bufLen, s.s.len - s.rd)
-      if result > 0:
-         copyMem(buf, addr(s.s[s.rd]), result)
-         inc(s.rd, result)
-
-   ctx.input_stream = llStreamOpenStdIn(llReadFromStdin)
+proc reinit_vm_state(ctx: RunContext) =
+   # Reset some variable before code execute
+   ctx.conf.errorCounter = 0
+   var c = PCtx ctx.graph.vm
+   c.oldErrorCount = 0
+   c.mode = emRepl
+   refresh(c, ctx.main_module, ctx.idgen)
 
 proc safe_compile_module(graph: ModuleGraph, ctx: RunContext, mf: AbsoluteFile): bool =
    var
@@ -492,12 +499,11 @@ proc safe_compile_module(graph: ModuleGraph, ctx: RunContext, mf: AbsoluteFile):
    proc on_compile_error(conf: ConfigRef; info: TLineInfo; msg: string; severity: Severity) {.gcsafe.} =
       if severity == Error and conf.m.errorOutputs.len != 0:
          success = false
-         if conf.errorCounter >= ctx.max_compiler_errors:
-            raise Reset()
 
    let old_hook = conf.structuredErrorHook
    conf.errorCounter = 0
    conf.structuredErrorHook = on_compile_error
+   reinit_vm_state(ctx)
    try:
       discard graph.compileModule(fileInfoIdx(conf, mf), {})
    except:
@@ -507,23 +513,100 @@ proc safe_compile_module(graph: ModuleGraph, ctx: RunContext, mf: AbsoluteFile):
 
    success
 
+proc get_imports_from_line(line: string): seq[string] =
+   if line.find('[') >= 0:
+      with_color(fgRed, false):
+         echo "Complex import with '[', ']' is not supportted."
+   else:
+      let line = line.replace("\p", "").strip
+      if line.startsWith("import "):
+         result = line[6..^1].replace(" ", "").split(',').mapIt(it.strip)
+      elif line.startsWith("include "):
+         result = line[7..^1].replace(" ", "").split(',').mapIt(it.strip)
+      elif line.startsWith("from "):
+         let endpos = line.find(" import ")
+         if endpos < 0:
+            echo "Import from without import."
+         else:
+            result = @[line[4..endpos].strip]
+
+proc compile_import_module(ctx: RunContext) =
+   var ok_imports: seq[string]
+   var imports = get_imports_from_line(ctx.last_input_line)
+   for f in imports:
+      if not is_failed_module(ctx, f):
+         let mf = findFile(ctx.conf, f & ".nim")
+         if not mf.isEmpty:
+            if ctx.graph.safe_compile_module(ctx, mf):
+               ok_imports.add(f)
+            else:
+               ctx.add_failed_module(f, mf.string)
+
+   if ok_imports.len > 0:
+      if ctx.last_input_line.startsWith("import "):
+         ctx.last_input_line = "import " & ok_imports.join(", ") & "\p"
+      elif ctx.last_input_line.startsWith("include "):
+         ctx.last_input_line = "include " & ok_imports.join(", ") & "\p"
+      else:
+         discard
+   else:
+      ctx.last_input_line = ""
+
+proc setup_input_stream(ctx: RunContext) =
+   proc llReadFromStdin(s: PLLStream, buf: pointer, bufLen: int): int =
+      # Ensure the output is fine
+      enable_output(ctx.conf)
+
+      s.rd = 0
+      if s.lineOffset < 0:
+         # This line indicate that the code will not be added to input_lines_good
+         ctx.last_input_line = ""
+
+         s.s = ctx.pre_load_code & ctx.input_lines_good.join("")
+         if opt_verbose.on:
+            with_color(fgRed, false):
+               echo "Reload code:"
+            with_color(fgCyan, false):
+               echo s.s
+
+         # When the code reloaded or vm reset, we need to re-execute the saved code,
+         # at this time, we should disable output, or else the output will confuse
+         # the user.
+         disable_output(ctx.conf)
+      else:
+         s.s = get_line(ctx)
+         ctx.last_line_is_import = ctx.last_input_line.is_import_line
+         if ctx.last_line_is_import:
+            compile_import_module(ctx)
+            s.s = ctx.last_input_line
+
+      # set the lineOffset to 0, so the syntax error's line number will same
+      # with the input line number
+      s.lineOffset = 0
+
+      reinit_vm_state(ctx)
+
+      result = min(bufLen, s.s.len - s.rd)
+      if result > 0:
+         copyMem(buf, addr(s.s[s.rd]), result)
+         inc(s.rd, result)
+
+   ctx.input_stream = llStreamOpenStdIn(llReadFromStdin)
+
 proc setup_config_error_hook(ctx: RunContext) =
    proc on_compile_error(conf: ConfigRef; info: TLineInfo; msg: string; severity: Severity) {.gcsafe.} =
       if severity == Error and conf.m.errorOutputs.len != 0:
          if ctx.last_line_is_import:
-            # 出现import错误，一般需要reset虚拟机环境，否则会出各自异常
-            # 这里先不能直接抛出Reset异常，因为我们还需要输出异常信息
+            # When import error occured, the VM environment will be ruined,
+            # so we need reset the VM environment, we set flag here untill
+            # some errors displayed
             ctx.last_line_need_reset = true
 
+            # If we compile module before import, this code will never be
+            # triggered, because import always successful
             if conf.errorCounter >= ctx.max_compiler_errors:
                with_color(fgRed, false):
                   echo "Too many error occured, skip..."
-
-               # 这里可以直接抛出异常了, 不需要屏蔽输出了
-               if opt_import_error_to_reset_module.on:
-                  raise Reset()
-               else:
-                  raise Reload()
          else:
             ctx.last_line_has_error = true
 
@@ -551,9 +634,7 @@ proc register_custom_vmops(vm: PEvalContext, ctx: RunContext, graph: ModuleGraph
          func make_tchar(s: string): string
          func make_utf8(s: string): string
 
-   graph.compileSystemModule()
-
-   # 将注册的API作为一个模块自动import
+   # Registered api as implit import module
    const native_import_procs_def = native_import_procs
    let sf = getTempDir() / "scriptapi.nim"
    block:
@@ -600,7 +681,7 @@ proc setup_vm_config(ctx: RunContext, conf: ConfigRef) =
    conf.symbolFiles = disabledSf
    conf.selectedGC = gcUnselected
 
-   # 使用incremental compile cache, 目前看起来好像对模块加载速度没有多大提高
+   # Use incremental compile cache, up to now, there is no speed improve, so disable it
    when false:
       if opt_using_ic_cache.on:
          conf.symbolFiles = v2Sf
@@ -618,10 +699,18 @@ proc create_script_vm(ctx: RunContext, graph: ModuleGraph): PCtx =
    const name = "script"
    var m = graph.makeModule(AbsoluteFile name)
    ctx.main_module = m
+   ctx.idgen = idGeneratorFromModule(m)
 
-   var vm = setupVM(m, graph.cache, name, graph, idGeneratorFromModule(m))
+   var vm = setupVM(m, graph.cache, name, graph, ctx.idgen)
    graph.vm = vm
+   graph.compileSystemModule()
    return vm
+
+proc set_stop_compile_handler(ctx: RunContext, graph: ModuleGraph) =
+   proc stop(): bool =
+      ctx.conf.errorCounter >= ctx.max_compiler_errors
+
+   graph.doStopCompile = stop
 
 proc load_preload_module(ctx: RunContext, graph: ModuleGraph) =
    var conf = graph.config
@@ -632,7 +721,7 @@ proc load_preload_module(ctx: RunContext, graph: ModuleGraph) =
 
    var pre_compile_module: seq[string]
 
-   # 预编译这些模块，这样在出现异常重新加载的时候，就不需要重新解析了
+   # Pre-load this module
    var pre_load_module: seq[string]
    if not opt_no_preload_module.on:
       pre_load_module =  @["strutils", "strformat", "os", "tables", "sets", "math", "json", "macros"]
@@ -652,35 +741,46 @@ proc load_preload_module(ctx: RunContext, graph: ModuleGraph) =
    if ctx.scriptapi_import != "":
       pre_compile_module.add ctx.scriptapi_import
 
-   # 缺省import的模块
    if pre_compile_module.len > 0:
-      ctx.pre_load_code = "import " & pre_compile_module.join(",") & "\p"
+      ctx.pre_load_code = "import " & pre_compile_module.join(", ") & "\p"
    else:
       ctx.pre_load_code = ""
 
-proc setup_vm_environment(ctx: RunContext, graph: ModuleGraph) =
-   setup_input_stream(ctx)
-   setup_vm_config(ctx, graph.config)
+proc setup_compile_environment(ctx: RunContext) =
+   var graph = newModuleGraph(newIdentCache(), ctx.conf)
+   ctx.graph = graph
+   set_stop_compile_handler(ctx, graph)
+   setup_vm_config(ctx, ctx.conf)
    setup_config_error_hook(ctx)
    setup_interactive_passes(graph)
 
    var vm = create_script_vm(ctx, graph)
    vm.register_custom_vmops(ctx, graph)
-   load_preload_module(ctx, graph)
+
+proc setup_vm_environment(ctx: RunContext) =
+   setup_input_stream(ctx)
+   setup_compile_environment(ctx)
+   load_preload_module(ctx, ctx.graph)
 
 proc run_repl(ctx: RunContext) =
-   var graph = newModuleGraph(newIdentCache(), ctx.conf)
-   setup_vm_environment(ctx, graph)
+   setup_vm_environment(ctx)
 
-   # 存在3种类型的出错：
-   # 1. 输入代码语法错，一般不需要额外操作，只是把错误的代码忽略就可以
-   # 2. 输入代码抛出异常，这个时候原来的代码建立的环境会失效，需要重新执行一遍代码，就是reload
-   # 3. 如果输入import times这种，可能会破坏整个vm，这个时候需要重建整个环境，就是reset
+   # There is three type errors:
+   # 1. General syntax error, nothing to do, just ignore it.
+   # 2. The code or compiler raise exception, sometime vm enviroment
+   #    like symbol table will ruined, maybe we need reload the code,
+   #    there is option to control this.
+   # 3. Error when import module, the vm enviroment is ruined almost,
+   #    we need reset the vm, there is config to control reload code
+   #    or reset vm. But now, we will compile module first, so there
+   #    is no need to reload code or reset vm, anyway, you can still
+   #    reset the vm using command :r or :rs
+
    while true:
       try:
          ctx.init()
-         let vm = cast[PCtx](graph.vm)
-         graph.processModule(ctx.main_module, vm.idgen, ctx.input_stream)
+         let vm = cast[PCtx](ctx.graph.vm)
+         ctx.graph.processModule(ctx.main_module, ctx.idgen, ctx.input_stream)
       except ResetError:
          break
       except ReloadError:
@@ -701,13 +801,14 @@ proc run_repl(ctx: RunContext) =
             break
 
 proc ctrl_c_proc() {.noconv.} =
+   sleep(100)
    quit "CTRL-C pressed, quit."
 
 proc main() =
    var
       nimlib = ""
       imports: seq[string]
-      ctx = RunContext(max_compiler_errors: 10)
+      ctx = RunContext(max_compiler_errors: 5)
 
    let argv = commandLineParams().mapIt((if it[0] == '-' and it.len >= 3 and it[1] != '-': "-" & it else: it))
    for kind, key, val in getopt(cmdline = argv):
@@ -730,6 +831,8 @@ proc main() =
             ctx.options.incl opt_exception_to_reset_module
          of "error-to-reload":
             ctx.options.incl opt_error_to_reload_code
+         of "verbose":
+            ctx.options.incl opt_verbose
          of "max-compiler-errors":
             ctx.max_compiler_errors = parseInt(val)
          else:
