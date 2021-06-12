@@ -223,6 +223,18 @@ proc print_loaded_module(graph: ModuleGraph) =
          let f = toFullPath(conf, FileIndex i)
          echo &"idx: {i}, name: {f}"
 
+proc print_module_sym(graph: ModuleGraph, m: PSym) =
+   for s in allSyms(graph, m):
+      echo s
+
+proc print_vm_globals(graph: ModuleGraph) =
+   let c = PCtx graph.vm
+   echo "Total globals:", c.globals.len
+   let xlen = c.globals.len
+   if xlen > 0:
+      for i in 0..xlen-1:
+         echo c.globals[i][]
+
 ## paste mode
 ## don't do any indent, add the code directly
 ## it is used to paste code to terminal
@@ -278,13 +290,13 @@ proc my_read_line(ctx: RunContext): string =
             ctx.toggle_option(opt_using_ic_cache)
             with_color(fgCyan, false):
                echo "Using incremental cache is " & opt_using_ic_cache.onoff
-      of "savecode", "sc", "cache":
+      of "save-code", "sc", "cache":
          ctx.toggle_option(opt_save_nims_code)
          with_color(fgCyan, false):
             echo "Save nims code is(sc) " & opt_save_nims_code.onoff
       of "show", "s":
          show_raw_buffer(ctx.input_lines_good.join(""), "Current buffer")
-      of "maxerrors", "me":
+      of "max-errors", "me":
          if cmds.len > 1:
             ctx.max_compiler_errors = argn(1, ctx.max_compiler_errors)
          with_color(fgCyan, false):
@@ -324,15 +336,15 @@ proc my_read_line(ctx: RunContext): string =
       of "load", "ll":
          ctx.input_lines_good = load_nims_cache_file()
          raise Reload()
-      of "errormode", "sem", "error":
+      of "error-mode", "sem", "error":
          ctx.toggle_option(opt_error_to_reload_code)
          with_color(fgCyan, false):
             echo "Syntax error to reload mode is(sem) " & opt_error_to_reload_code.onoff
-      of "exceptmode", "eem", "except":
+      of "except-mode", "eem", "except":
          ctx.toggle_option(opt_exception_to_reset_module)
          with_color(fgCyan, false):
             echo "Exception error to reset mode is(eem) " & opt_exception_to_reset_module.onoff
-      of "importerrormode", "iem":
+      of "import-error-mode", "iem":
          ctx.toggle_option(opt_import_error_to_reset_module)
          with_color(fgCyan, false):
             echo "Import error to reset mode is(iem) " & opt_import_error_to_reset_module.onoff
@@ -344,10 +356,9 @@ proc my_read_line(ctx: RunContext): string =
             echo "Save nims code is(sc) " & opt_save_nims_code.onoff
             echo "Paste mode is(p) " & opt_paste_mode.onoff
             echo "Max compiler errors is(me) " & $ctx.max_compiler_errors
+            echo "Verbose mode is " & opt_verbose.onoff
             when false:
                echo "Using incremental cache is " & opt_using_ic_cache.onoff
-            # echo "Verbose mode is " & opt_verbose.onoff
-            echo "Max compiler errors is " & $ctx.max_compiler_errors
       of "reload", "rr":
          raise Reload()
       of "reset", "r", "rs", "rb":
@@ -364,9 +375,20 @@ proc my_read_line(ctx: RunContext): string =
             ctx.options.incl opt_check_failed_module_time
 
          raise Reset()
-      of "print_loaded_module":
+      of "print-loaded-module":
          with_color(fgCyan, false):
             print_loaded_module(ctx.graph)
+      of "print-module-sym":
+         let idx = argn(1, 0)
+         if idx >= ctx.graph.ifaces.len:
+            with_color(fgCyan, false):
+               echo "Max module number is: ", ctx.graph.ifaces.len - 1
+         else:
+            with_color(fgCyan, false):
+               print_module_sym(ctx.graph, getModule(ctx.graph, FileIndex idx))
+      of "print-vm-globals":
+         with_color(fgCyan, false):
+            print_vm_globals(ctx.graph)
       else:
          with_color(fgRed, false):
             echo &"Unknown command {cmds[0]}."
@@ -397,7 +419,7 @@ proc my_read_line(ctx: RunContext): string =
       if cmds.len > 0 and cmds[0].len > 0:
          case cmds[0][0]
          of ':', '\\':
-            doCmd(cmds[0][1..^1])
+            doCmd(cmds[0][1..^1].replace('_', '-'))
             continue
          of '!':
             discard execShellCmd(myline.strip[1..^1])
@@ -459,9 +481,13 @@ proc get_line(ctx: RunContext): string =
 
    if ctx.last_line_has_error:
       ctx.last_line_has_error = false
-      ctx.last_input_line = ""
+
+      #if ctx.last_input_line.startsWith("var ") or ctx.last_input_line.startsWith("let "):
+      #   ctx.last_input_line = ""
+      #   raise Reload()
 
       if opt_error_to_reload_code.on:
+         ctx.last_input_line = ""
          raise Reload()
       else:
          # Some time syntax error will make the next line code doesn't output result,
@@ -520,7 +546,10 @@ proc get_imports_from_line(line: string): seq[string] =
    else:
       let line = line.replace("\p", "").strip
       if line.startsWith("import "):
-         result = line[6..^1].replace(" ", "").split(',').mapIt(it.strip)
+         var endpos = line.find(" except ")
+         if endpos < 0:
+            endpos = line.len - 1
+         result = line[6..endpos].replace(" ", "").split(',').mapIt(it.strip)
       elif line.startsWith("include "):
          result = line[7..^1].replace(" ", "").split(',').mapIt(it.strip)
       elif line.startsWith("from "):
@@ -543,11 +572,11 @@ proc compile_import_module(ctx: RunContext) =
                ctx.add_failed_module(f, mf.string)
 
    if ok_imports.len > 0:
-      if ctx.last_input_line.startsWith("import "):
+      if ctx.last_input_line.startsWith("import ") and ctx.last_input_line.find(" except ") < 0:
          ctx.last_input_line = "import " & ok_imports.join(", ") & "\p"
       elif ctx.last_input_line.startsWith("include "):
          ctx.last_input_line = "include " & ok_imports.join(", ") & "\p"
-      else:
+      else: # from ... import ... / import ... except ...
          discard
    else:
       ctx.last_input_line = ""
@@ -767,8 +796,8 @@ proc run_repl(ctx: RunContext) =
 
    # There is three type errors:
    # 1. General syntax error, nothing to do, just ignore it.
-   # 2. The code or compiler raise exception, sometime vm enviroment
-   #    like symbol table will ruined, maybe we need reload the code,
+   # 2. The code or compiler raise exception, sometime code context
+   #    like global variable will polluted, so we need reload the code,
    #    there is option to control this.
    # 3. Error when import module, the vm enviroment is ruined almost,
    #    we need reset the vm, there is config to control reload code
@@ -810,6 +839,17 @@ proc main() =
       imports: seq[string]
       ctx = RunContext(max_compiler_errors: 5)
 
+   template process_switch_on_off(o: RunOption, val: string) =
+      let s = if val == "": "on" else: val
+      if val in ["on", "1"]:
+         ctx.options.incl o
+      elif val in ["off", "0"]:
+         ctx.options.excl o
+      else:
+         quit("Option value must be [on, off, 1, 0].")
+
+   ctx.options.incl {opt_error_to_reload_code}
+
    let argv = commandLineParams().mapIt((if it[0] == '-' and it.len >= 3 and it[1] != '-': "-" & it else: it))
    for kind, key, val in getopt(cmdline = argv):
       case kind
@@ -821,18 +861,19 @@ proc main() =
             if file_exists(val / "system.nim"):
                nimlib = val
          of "cache":
-            ctx.options.incl opt_save_nims_code
-            ctx.input_lines_good = load_nims_cache_file()
+            process_switch_on_off(opt_save_nims_code, val)
+            if opt_save_nims_code.on:
+               ctx.input_lines_good = load_nims_cache_file()
          of "no-preload-module":
-            ctx.options.incl opt_no_preload_module
+            process_switch_on_off(opt_no_preload_module, val)
          of "import-error-to-reset":
-            ctx.options.incl opt_import_error_to_reset_module
+            process_switch_on_off(opt_import_error_to_reset_module, val)
          of "exception-to-reset":
-            ctx.options.incl opt_exception_to_reset_module
+            process_switch_on_off(opt_exception_to_reset_module, val)
          of "error-to-reload":
-            ctx.options.incl opt_error_to_reload_code
+            process_switch_on_off(opt_error_to_reload_code, val)
          of "verbose":
-            ctx.options.incl opt_verbose
+            process_switch_on_off(opt_verbose, val)
          of "max-compiler-errors":
             ctx.max_compiler_errors = parseInt(val)
          else:
