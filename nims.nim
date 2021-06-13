@@ -41,6 +41,7 @@ type
       opt_import_error_to_reset_module
       opt_error_to_reload_code
       opt_check_failed_module_time
+      opt_auto_add_var
       opt_paste_mode
       opt_using_ic_cache
 
@@ -165,8 +166,13 @@ func continue_line*(line: string): bool =
 func is_all_space(line: string): bool =
    line == "" or line.allIt(it == ' ')
 
+const
+   sImport = "import "
+   sInclue = "include "
+   sFrom = "from "
+
 func is_import_line(s: string): bool =
-   s.startsWith("import ") or s.startsWith("from ") or s.startsWith("include ")
+   s.startsWith(sImport) or s.startsWith(sFrom) or s.startsWith(sInclue)
 
 proc disable_stdout() =
    const device = when defined(windows): "NUL" else: "/dev/null"
@@ -233,21 +239,21 @@ proc print_module_syms(graph: ModuleGraph, m: PSym) =
    let interf = semtabAll(graph, m)
    echo "Symbol counts:", interf.counter
    for s in interf:
-      echo s.name[]
+      echo &"{s.kind} {s.name.s}: {s.typ.kind}"
 
 proc print_vm_globals(graph: ModuleGraph) =
    let c = PCtx graph.vm
    echo "Total globals:", c.globals.len
    let xlen = c.globals.len
-   if xlen > 0:
-      for i in 0..xlen-1:
-         let n = c.globals[i][]
-         echo n.info.line, n
+   for i in 0..<xlen:
+      let n = c.globals[i][]
+      echo n.info.line, n
+
 
 proc is_var_exists(graph: ModuleGraph, m: PSym, name: string): bool =
    let interf = semtabAll(graph, m)
    for s in interf:
-      if s.name.s == name:
+      if s.kind in {skLet, skVar} and s.name.s == name:
          return true
 
    return false
@@ -349,6 +355,10 @@ proc my_read_line(ctx: RunContext): string =
 
                   if opt_save_nims_code.on:
                      save_nims_cache_file(ctx.input_lines_good)
+      of "auto-var", "av":
+         ctx.toggle_option(opt_auto_add_var)
+         with_color(fgCyan, false):
+            echo "Auto create variable(av) " & opt_auto_add_var.onoff
       of "error-mode", "sem", "error":
          ctx.toggle_option(opt_error_to_reload_code)
          with_color(fgCyan, false):
@@ -366,6 +376,7 @@ proc my_read_line(ctx: RunContext): string =
             echo "Syntax error to reload mode is(sem) " & opt_error_to_reload_code.onoff
             echo "Exception error to reset mode is(eem) " & opt_exception_to_reset_module.onoff
             echo "Import error to reset mode is(iem) " & opt_import_error_to_reset_module.onoff
+            echo "Auto create variable(av) " & opt_auto_add_var.onoff
             echo "Save nims code is(sc) " & opt_save_nims_code.onoff
             echo "Paste mode is(p) " & opt_paste_mode.onoff
             echo "Verbose mode is " & opt_verbose.onoff
@@ -543,7 +554,6 @@ proc safe_compile_module(graph: ModuleGraph, ctx: RunContext, mf: AbsoluteFile):
          success = false
 
    let old_hook = conf.structuredErrorHook
-   conf.errorCounter = 0
    conf.structuredErrorHook = on_compile_error
    reinit_vm_state(ctx)
    try:
@@ -561,19 +571,19 @@ proc get_imports_from_line(line: string): seq[string] =
          echo "Complex import with '[', ']' is not supportted."
    else:
       let line = line.replace("\p", "").strip
-      if line.startsWith("import "):
+      if line.startsWith(sImport):
          var endpos = line.find(" except ")
          if endpos < 0:
             endpos = line.len - 1
-         result = line[6..endpos].replace(" ", "").split(',').mapIt(it.strip)
-      elif line.startsWith("include "):
-         result = line[7..^1].replace(" ", "").split(',').mapIt(it.strip)
-      elif line.startsWith("from "):
+         result = line[sImport.len..endpos].replace(" ", "").split(',').mapIt(it.strip)
+      elif line.startsWith(sInclue):
+         result = line[sInclue.len..^1].replace(" ", "").split(',').mapIt(it.strip)
+      elif line.startsWith(sFrom):
          let endpos = line.find(" import ")
          if endpos < 0:
             echo "Import from without import."
          else:
-            result = @[line[4..endpos].strip]
+            result = @[line[sFrom.len..endpos].strip]
 
 proc compile_import_module(ctx: RunContext) =
    var ok_imports: seq[string]
@@ -588,11 +598,13 @@ proc compile_import_module(ctx: RunContext) =
                ctx.add_failed_module(f, mf.string)
 
    if ok_imports.len > 0:
-      if ctx.last_input_line.startsWith("import ") and ctx.last_input_line.find(" except ") < 0:
-         ctx.last_input_line = "import " & ok_imports.join(", ") & "\p"
-      elif ctx.last_input_line.startsWith("include "):
-         ctx.last_input_line = "include " & ok_imports.join(", ") & "\p"
-      else: # from ... import ... / import ... except ...
+      if ctx.last_input_line.startsWith(sImport) and
+         ctx.last_input_line.find(" except ") < 0 and
+         ctx.last_input_line.find(" as ") < 0:
+         ctx.last_input_line = sImport & ok_imports.join(", ") & "\p"
+      elif ctx.last_input_line.startsWith(sImport):
+         ctx.last_input_line = sInclue & ok_imports.join(", ") & "\p"
+      else: # from ... import ... / import ... except ... / import ... as ...
          discard
    else:
       ctx.last_input_line = ""
@@ -607,6 +619,11 @@ proc check_var_set_value(ctx: RunContext): bool =
             if is_var_exists(ctx.graph, ctx.main_module, v):
                ctx.last_input_line = ctx.last_input_line[4..^1].strip(trailing = false)
                return true
+   elif opt_auto_add_var.on and ctx.last_input_line.find('=') >= 0:
+      let v = ctx.last_input_line.split('=')[0].strip
+      if v.validIdentifier and not is_var_exists(ctx.graph, ctx.main_module, v):
+         ctx.last_input_line = "var " & ctx.last_input_line
+         return true
    return false
 
 proc setup_input_stream(ctx: RunContext) =
@@ -871,15 +888,16 @@ proc main() =
       ctx = RunContext(max_compiler_errors: 5)
 
    template process_switch_on_off(o: RunOption, val: string) =
-      let s = if val == "": "on" else: val
-      if val in ["on", "1"]:
-         ctx.options.incl o
-      elif val in ["off", "0"]:
-         ctx.options.excl o
-      else:
-         quit("Option value must be [on, off, 1, 0].")
+      block:
+         let s = if val == "": "on" else: val
+         if s == "on":
+            ctx.options.incl o
+         elif s == "off":
+            ctx.options.excl o
+         else:
+            quit("Option value must be [on, off].")
 
-   ctx.options.incl {opt_error_to_reload_code}
+   ctx.options.incl {opt_error_to_reload_code, opt_auto_add_var}
 
    let argv = commandLineParams().mapIt((if it[0] == '-' and it.len >= 3 and it[1] != '-': "-" & it else: it))
    for kind, key, val in getopt(cmdline = argv):
@@ -903,6 +921,8 @@ proc main() =
             process_switch_on_off(opt_exception_to_reset_module, val)
          of "error-to-reload":
             process_switch_on_off(opt_error_to_reload_code, val)
+         of "auto-add-var":
+            process_switch_on_off(opt_auto_add_var, val)
          of "verbose":
             process_switch_on_off(opt_verbose, val)
          of "max-compiler-errors":
