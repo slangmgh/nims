@@ -41,10 +41,9 @@ type
       opt_import_error_to_reset_module
       opt_error_to_reload_code
       opt_auto_add_var
+      opt_paste_by_input_time_elapse
       opt_paste_mode
-      opt_using_ic_cache
 
-   ErrorHook = proc(config: ConfigRef; info: TLineInfo; msg: string; severity: Severity) {.closure, gcsafe.}
    RunContext = ref object
       conf: ConfigRef
       graph: ModuleGraph
@@ -209,14 +208,6 @@ proc load_nims_cache_file(): seq[string] =
       defer: file.close
       result = readAll(file).split_lines.filterIt(it.strip() != "").mapIt(it & "\p")
 
-proc readLineFromStdin(prompt: string): (string, bool) =
-   let time_start = cpuTime()
-   stdout.write(prompt)
-   let s = readLine(stdin)
-   let time_end = cpuTime()
-   let is_paste = time_end - time_start < 0.08
-   (s, is_paste)
-
 type ResetError* = object of CatchableError
 type ReloadError* = object of CatchableError
 
@@ -260,6 +251,18 @@ proc is_var_exists(graph: ModuleGraph, m: PSym, name: string): bool =
 
    return false
 
+proc readLineFromStdin(ctx: RunContext, prompt: string): (string, bool) =
+   let time_start = cpuTime()
+   stdout.write(prompt)
+   let s = readLine(stdin)
+   let time_end = cpuTime()
+   let is_paste =
+      if opt_paste_by_input_time_elapse.on:
+         time_end - time_start < 0.08
+      else:
+         false
+   (s, is_paste)
+
 ## paste mode
 ## don't do any indent, add the code directly
 ## it is used to paste code to terminal
@@ -291,40 +294,44 @@ proc my_read_line(ctx: RunContext): string =
       case cmd
       of "help", "h":
          with_color(fgCyan, false):
-            echo ":help   [\\h]: Show help."
-            echo ":clear  [\\c]: Clear the input code."
-            echo ":show   [\\s]: Show the current code."
-            echo ":paste  [\\p]: Enable/Disable the paste mode."
-            echo ":except [\\e]: Enable/Disable the except to reset mode."
-            echo ":option [\\o]: Show current options."
-            echo ":reset  [\\r]: Reset the vm to init state."
-            echo ":exit   [\\q]: Exit the program."
+            echo ":help, :h                : Show help."
+            echo ":clear, :c NUM           : Clear the last NUM line or all codes."
+            echo ":keep, :k NUM            : Keep the first NUM like codes."
+            echo ":show, :s                : Show the current code in buffer."
+            echo ":paste, :p               : Toggle the paste mode."
+            echo ":cache                   : Toggle the auto save/load the script codes."
+            echo ":auto-create-var         : Toggle auto create var when not exist."
+            echo ":error-to-reload         : Toggle syntax error to reload mode."
+            echo ":max-errors NUM          : Set max compiler errors to NUM."
+            echo ":option, :o              : Show current options."
+            echo ":reload, :r              : Reload the code manually."
+            echo ":reset, :rr              : Reset the vm to manually."
+            echo ":exit, :q, :x            : Exit the program."
       of "exit", "quit", "q", "x":
          quit()
-      of "verbose", "debug", "v", "d":
+      of "verbose", "v", "d":
          ctx.toggle_option(opt_verbose)
          with_color(fgCyan, false):
-            echo "Debug mode is " & opt_verbose.onoff
+            echo "Verbose mode is " & opt_verbose.onoff
+      of "paste-by-time-elapse", "pte", "tep":
+         ctx.toggle_option(opt_paste_by_input_time_elapse)
+         with_color(fgCyan, false):
+            echo "Paste according to input time elapse(pte): " & opt_paste_by_input_time_elapse.onoff
       of "paste", "p":
          ctx.toggle_option(opt_paste_mode)
          with_color(fgCyan, false):
-            echo "Paste mode is(p) " & opt_paste_mode.onoff
-      of "ic", "iccache":
-         when false:
-            ctx.toggle_option(opt_using_ic_cache)
-            with_color(fgCyan, false):
-               echo "Using incremental cache is " & opt_using_ic_cache.onoff
-      of "save-code", "sc", "cache":
+            echo "Paste mode(p): " & opt_paste_mode.onoff
+      of "auto-save-code", "asc", "cache":
          ctx.toggle_option(opt_save_nims_code)
          with_color(fgCyan, false):
-            echo "Save nims code is(sc) " & opt_save_nims_code.onoff
+            echo "Auto save/load script code(asc): " & opt_save_nims_code.onoff
       of "show", "s":
          show_raw_buffer(ctx.input_lines_good.join(""), "Current buffer")
       of "max-errors", "me":
          if cmds.len > 1:
             ctx.max_compiler_errors = argn(1, ctx.max_compiler_errors)
          with_color(fgCyan, false):
-            echo "Max compiler errors is(me) " & $ctx.max_compiler_errors
+            echo "Max compiler errors(me): " & $ctx.max_compiler_errors
       of "clean", "clear", "c":
          if ctx.input_lines_good.len > 0:
             let clear_line_count = argn(1, -1)
@@ -357,52 +364,70 @@ proc my_read_line(ctx: RunContext): string =
 
                   if opt_save_nims_code.on:
                      save_nims_cache_file(ctx.input_lines_good)
-      of "auto-var", "av":
+      of "auto-create-var", "acv":
          ctx.toggle_option(opt_auto_add_var)
          with_color(fgCyan, false):
-            echo "Auto create variable(av) " & opt_auto_add_var.onoff
-      of "error-mode", "sem", "error":
+            echo "Auto create variable(acv) " & opt_auto_add_var.onoff
+      of "error-to-reload", "setr", "sem":
          ctx.toggle_option(opt_error_to_reload_code)
          with_color(fgCyan, false):
-            echo "Syntax error to reload mode is(sem) " & opt_error_to_reload_code.onoff
-      of "except-mode", "eem", "except":
+            echo "Syntax error to reload mode(setr) " & opt_error_to_reload_code.onoff
+      of "except-to-reset", "eetr", "eem":
          ctx.toggle_option(opt_exception_to_reset_module)
          with_color(fgCyan, false):
-            echo "Exception error to reset mode is(eem) " & opt_exception_to_reset_module.onoff
-      of "import-error-mode", "iem":
+            echo "Exception error to reset mode(eetr): " & opt_exception_to_reset_module.onoff
+      of "import-error-to-reset", "ietr", "iem":
          ctx.toggle_option(opt_import_error_to_reset_module)
          with_color(fgCyan, false):
-            echo "Import error to reset mode is(iem) " & opt_import_error_to_reset_module.onoff
+            echo "Import error to reset mode(ietr): " & opt_import_error_to_reset_module.onoff
       of "options", "option", "o":
          with_color(fgCyan, false):
-            echo "Syntax error to reload mode is(sem) " & opt_error_to_reload_code.onoff
-            echo "Exception error to reset mode is(eem) " & opt_exception_to_reset_module.onoff
-            echo "Import error to reset mode is(iem) " & opt_import_error_to_reset_module.onoff
-            echo "Auto create variable(av) " & opt_auto_add_var.onoff
-            echo "Save nims code is(sc) " & opt_save_nims_code.onoff
-            echo "Paste mode is(p) " & opt_paste_mode.onoff
-            echo "Verbose mode is " & opt_verbose.onoff
-            echo "Max compiler errors is(me) " & $ctx.max_compiler_errors
-            when false:
-               echo "Using incremental cache is " & opt_using_ic_cache.onoff
+            echo "Syntax error to reload mode(setr): " & opt_error_to_reload_code.onoff
+            echo "Exception error to reset mode(eetr): " & opt_exception_to_reset_module.onoff
+            echo "Import error to reset mode(ietr): " & opt_import_error_to_reset_module.onoff
+            echo "Auto create variable(acv): " & opt_auto_add_var.onoff
+            echo "Auto save/load script code(asc): " & opt_save_nims_code.onoff
+            echo "Paste according to input time elapse(pte): " & opt_paste_by_input_time_elapse.onoff
+            echo "Paste mode(p): " & opt_paste_mode.onoff
+            echo "Max compiler errors(me): " & $ctx.max_compiler_errors
       of "load", "ll":
          ctx.input_lines_good = load_nims_cache_file()
+         if opt_verbose.on:
+            with_color(fgRed, false):
+               echo "Load code from cache file."
          raise Reload()
-      of "reload", "rr":
-         raise Reload()
-      of "reset", "r", "rs", "rb":
+      of "reload", "r", "rs":
          if cmd == "rs": # Clear the input buffer before reset
             ctx.input_lines_good = @[]
+            if opt_verbose.on:
+               with_color(fgRed, false):
+                  echo "Clear the code buffer."
             if opt_save_nims_code.on:
                save_nims_cache_file(ctx.input_lines_good)
 
-         if cmd == "rb": # Clear the failed import module before reset
+         if opt_verbose.on:
+            with_color(fgRed, false):
+               echo "Reload the code."
+         raise Reload()
+      of "reset", "rr", "rrs", "rrb":
+         if cmd == "rrs": # Clear the input buffer before reset
+            ctx.input_lines_good = @[]
+            if opt_verbose.on:
+               with_color(fgRed, false):
+                  echo "Clear the code buffer."
+            if opt_save_nims_code.on:
+               save_nims_cache_file(ctx.input_lines_good)
+
+         if cmd == "rrb": # Clear the failed import module before reset
             ctx.failed_imports = @[]
          else:
             # Reset vm manually，we need to check the modified time of failed module
             # to see if it need reload
             ctx.check_failed_module_time = true
 
+         if opt_verbose.on:
+            with_color(fgRed, false):
+               echo "Reset the vm environment."
          raise Reset()
       of "print-loaded-module", "plm":
          with_color(fgCyan, false):
@@ -427,17 +452,17 @@ proc my_read_line(ctx: RunContext): string =
       indent_level = 0
       triples = 0
       line_no = 1
+      paste_mode = opt_paste_mode.on
 
    while true:
-      var (myline, is_paste) = readLineFromStdin(get_prompt(indent_level, line_no))
+      var (myline, is_paste) = readLineFromStdin(ctx, get_prompt(indent_level, line_no))
 
-      if opt_paste_mode.on:
-         ctx.options.excl opt_paste_mode
+      if paste_mode:
          add_line()
          continue
 
-      if myline.len > 0 and myline[0] == '#':
-         ctx.options.incl opt_paste_mode
+      if buffer == "" and myline.len > 0 and myline[0] == '#':
+         paste_mode = true
          continue
 
       if is_paste:
@@ -639,7 +664,7 @@ proc setup_input_stream(ctx: RunContext) =
          s.s = ctx.pre_load_code & ctx.input_lines_good.join("")
          if opt_verbose.on:
             with_color(fgRed, false):
-               echo "Reload code:"
+               echo "Run startup code:"
             with_color(fgCyan, false):
                echo s.s
 
@@ -757,15 +782,6 @@ proc setup_vm_config(ctx: RunContext) =
 
    conf.symbolFiles = disabledSf
    conf.selectedGC = gcUnselected
-
-   # Use incremental compile cache, up to now, there is no speed improve, so disable it
-   when false:
-      if opt_using_ic_cache.on:
-         conf.symbolFiles = v2Sf
-         conf.cCompiler = ccNone
-         conf.selectedGC = gcUnselected
-         conf.options = {}
-         conf.globalOptions = {}
 
    when hasFFI:
       conf.features.incl compiletimeFFI
@@ -889,10 +905,38 @@ proc rebuild_vm_environment(ctx: RunContext) =
    ctx.graph = newModuleGraph(newIdentCache(), ctx.conf)
    setup_vm_environment(ctx)
 
+const HelpText = """
++----------------------------------------------------------------------------+
+|                            Simple nim repl                                 |
+|                             Version 0.2                                    |
++----------------------------------------------------------------------------+
+Build time: $1 $2
+
+Usage:
+  nims [options] [modules ...]
+
+Options:
+  --help, -h                     show help
+  --nimpath:PATH                 set nim directory, contains lib/system.nim
+  -p, --path:PATH                add path to search module
+  -c, --cache:on|off             turn auto load/save script code on|off (off)
+  --no-preload-module:on|off     turn load preload module off|on (off)
+  --auto-create-var:on|off       turn auto create var when not exist on|off (on)
+  --error-to-reload:on|off       turn reload on syntax error on|off (on)
+  --max-compiler-errors:NUM      set max compiler errors (5)
+
+Modules:
+   Module name list will be loaded at start.
+"""
+
+proc show_help() =
+   echo HelpText % [CompileDate, CompileTime]
+
 proc set_options_from_command_line(ctx: RunContext) =
    var
       nimlib = ""
-      imports: seq[string]
+      modules: seq[string]
+      paths: seq[string]
 
    template process_switch_on_off(o: RunOption, val: string) =
       block:
@@ -902,19 +946,24 @@ proc set_options_from_command_line(ctx: RunContext) =
          elif s == "off":
             ctx.options.excl o
          else:
-            quit("Option value must be [on, off].")
+            quit("Option value must be 'on' or 'off'.")
 
    let argv = commandLineParams().mapIt((if it[0] == '-' and it.len >= 3 and it[1] != '-': "-" & it else: it))
    for kind, key, val in getopt(cmdline = argv):
       case kind
       of cmdArgument:
-         imports.add key
+         modules.add key
       of cmdLongOption, cmdShortOption:
          case key
-         of "lib":
-            if file_exists(val / "system.nim"):
-               nimlib = val
-         of "cache":
+         of "help", "h":
+            show_help()
+            quit()
+         of "nimpath":
+            if file_exists(val / "lib" / "system.nim"):
+               nimlib = val / "lib"
+         of "p", "path":
+            paths.add val
+         of "c", "cache":
             process_switch_on_off(opt_save_nims_code, val)
             if opt_save_nims_code.on:
                ctx.input_lines_good = load_nims_cache_file()
@@ -939,10 +988,9 @@ proc set_options_from_command_line(ctx: RunContext) =
 
    if nimlib == "":
       nimlib = findNimStdLib()
-
-   if nimlib == "":
-      const exe_ext = when defined(windows): ".exe" else: ""
-      quit(&"Cannot find nim{exe_ext} in the PATH")
+      if nimlib == "":
+         const exe_ext = when defined(windows): ".exe" else: ""
+         quit(&"Cannot find nim{exe_ext} in the PATH")
 
    var libs = @[nimlib / "core",
                 nimlib / "pure",
@@ -953,13 +1001,15 @@ proc set_options_from_command_line(ctx: RunContext) =
    when my_special_vmops:
       libs.add(nimlib /../ "mylib")
 
+   libs.add paths
+
    let pkg_dir = (if getEnv("NIMBLE_DIR") != "": getEnv("NIMBLE_DIR") else: nimlib /../ "nimble") / "pkgs"
    for p in walkDir(pkg_dir):
       libs.add p.path
 
    ctx.libpath = nimlib
    ctx.libs = libs
-   ctx.imports = imports
+   ctx.imports = modules
 
 proc ctrl_c_proc() {.noconv.} =
    sleep(100)
