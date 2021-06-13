@@ -1,11 +1,11 @@
 ##
-## simple nim repl
+## Simple nim repl
 ##
-## compile with libffi, must use gcc
+## Compile with libffi, must use gcc, libffi doesn't support msvc
 ## >>> nimble install libffi
 ## >>> nim c --cc:gcc -d:release -d:nimcore -d:nimHasLibFFI nims.nim
 ##
-## compile without libffi
+## Compile without libffi
 ## >>> nim c -d:release -d:nimcore nims.nim
 ##
 
@@ -14,7 +14,7 @@ import "../../compiler" / [ast, astalgo, modules, passes, condsyms,
        options, sem, semdata, llstream, vm, vmdef, nimeval, lineinfos, msgs,
        modulegraphs, idents, pathutils, passaux, scriptconfig, parser]
 
-# import segfaults so we can catch NilAccessDefect
+# Import segfaults so we can catch NilAccessDefect
 # rather than crash the program and quit
 import segfaults
 
@@ -40,7 +40,6 @@ type
       opt_exception_to_reset_module
       opt_import_error_to_reset_module
       opt_error_to_reload_code
-      opt_check_failed_module_time
       opt_auto_add_var
       opt_paste_mode
       opt_using_ic_cache
@@ -68,6 +67,7 @@ type
       last_line_is_import: bool
       last_line_has_error: bool
       last_line_need_reset: bool
+      check_failed_module_time: bool
 
       pre_load_code: string
       input_lines_good: seq[string]
@@ -79,6 +79,8 @@ proc init(ctx: RunContext) =
    ctx.last_input_line = ""
    if not ctx.input_stream.isNil:
       ctx.input_stream.lineOffset = -1
+
+proc vm(ctx: RunContext): PCtx = PCtx ctx.graph.vm
 
 proc copy(ctx: RunContext): RunContext =
    RunContext(
@@ -241,7 +243,7 @@ proc print_module_syms(graph: ModuleGraph, m: PSym) =
    for s in interf:
       echo &"{s.kind} {s.name.s}: {s.typ.kind}"
 
-proc print_vm_globals(graph: ModuleGraph) =
+proc print_global_values(graph: ModuleGraph) =
    let c = PCtx graph.vm
    echo "Total globals:", c.globals.len
    let xlen = c.globals.len
@@ -399,13 +401,13 @@ proc my_read_line(ctx: RunContext): string =
          else:
             # Reset vm manually，we need to check the modified time of failed module
             # to see if it need reload
-            ctx.options.incl opt_check_failed_module_time
+            ctx.check_failed_module_time = true
 
          raise Reset()
-      of "print-loaded-module":
+      of "print-loaded-module", "plm":
          with_color(fgCyan, false):
             print_loaded_module(ctx.graph)
-      of "print-module-syms":
+      of "print-module-syms", "pms":
          let idx = argn(1, 0)
          if idx >= ctx.graph.ifaces.len:
             with_color(fgCyan, false):
@@ -413,9 +415,9 @@ proc my_read_line(ctx: RunContext): string =
          else:
             with_color(fgCyan, false):
                print_module_syms(ctx.graph, getModule(ctx.graph, FileIndex idx))
-      of "print-vm-globals":
+      of "print-global-values", "pgv":
          with_color(fgCyan, false):
-            print_vm_globals(ctx.graph)
+            print_global_values(ctx.graph)
       else:
          with_color(fgRed, false):
             echo &"Unknown command {cmds[0]}."
@@ -509,15 +511,13 @@ proc get_line(ctx: RunContext): string =
    if ctx.last_line_has_error:
       ctx.last_line_has_error = false
 
-      #if ctx.last_input_line.startsWith("var ") or ctx.last_input_line.startsWith("let "):
-      #   ctx.last_input_line = ""
-      #   raise Reload()
-
-      if opt_error_to_reload_code.on:
+      if opt_error_to_reload_code.on or
+         ctx.last_input_line.startsWith("var ") or ctx.last_input_line.startsWith("let "):
+         # Sometime syntax error will make scope context error, so maybe we need reload
          ctx.last_input_line = ""
          raise Reload()
       else:
-         # Some time syntax error will make the next line code doesn't output result,
+         # Sometime syntax error will make the next line code doesn't output result,
          # so we add an empty echo to fix this.
          # For example, input &"{\"xx"}" will make the display disappear sometime, it
          # not always true of cause.
@@ -539,12 +539,12 @@ proc get_line(ctx: RunContext): string =
 proc reinit_vm_state(ctx: RunContext) =
    # Reset some variable before code execute
    ctx.conf.errorCounter = 0
-   var c = PCtx ctx.graph.vm
-   c.oldErrorCount = 0
-   c.mode = emRepl
-   refresh(c, ctx.main_module, ctx.idgen)
+   var vm = ctx.vm
+   vm.oldErrorCount = 0
+   vm.mode = emRepl
+   refresh(vm, ctx.main_module, ctx.idgen)
 
-proc safe_compile_module(graph: ModuleGraph, ctx: RunContext, mf: AbsoluteFile): bool =
+proc safe_compile_module(ctx: RunContext, mf: AbsoluteFile): bool =
    var
       conf = ctx.conf
       success = true
@@ -557,7 +557,7 @@ proc safe_compile_module(graph: ModuleGraph, ctx: RunContext, mf: AbsoluteFile):
    conf.structuredErrorHook = on_compile_error
    reinit_vm_state(ctx)
    try:
-      discard graph.compileModule(fileInfoIdx(conf, mf), {})
+      discard ctx.graph.compileModule(fileInfoIdx(conf, mf), {})
    except:
       success = false
    finally:
@@ -592,7 +592,7 @@ proc compile_import_module(ctx: RunContext) =
       if not is_failed_module(ctx, f):
          let mf = findFile(ctx.conf, f & ".nim")
          if not mf.isEmpty:
-            if ctx.graph.safe_compile_module(ctx, mf):
+            if safe_compile_module(ctx, mf):
                ok_imports.add(f)
             else:
                ctx.add_failed_module(f, mf.string)
@@ -656,8 +656,8 @@ proc setup_input_stream(ctx: RunContext) =
          elif check_var_set_value(ctx):
             s.s = ctx.last_input_line
 
-      # set the lineOffset to 0, so the syntax error's line number will same
-      # with the input line number
+      # Set the lineOffset to 0, so the syntax error's line number will be same
+      # with the line number in input prompt
       s.lineOffset = 0
 
       reinit_vm_state(ctx)
@@ -688,7 +688,7 @@ proc setup_config_error_hook(ctx: RunContext) =
 
    ctx.conf.structuredErrorHook = on_compile_error
 
-proc register_custom_vmops(vm: PEvalContext, ctx: RunContext, graph: ModuleGraph) =
+proc register_custom_vmops(vm: PEvalContext, ctx: RunContext) =
    var
       conf = ctx.conf
 
@@ -720,11 +720,11 @@ proc register_custom_vmops(vm: PEvalContext, ctx: RunContext, graph: ModuleGraph
       ctx.scriptapi_import = sf.changeFileExt("")
 
    conf.implicitImports.add sf
-   discard graph.safe_compile_module(ctx, AbsoluteFile sf)
+   discard safe_compile_module(ctx, AbsoluteFile sf)
 
-proc setup_interactive_passes(graph: ModuleGraph) =
-   registerPass(graph, semPass)
-   registerPass(graph, evalPass)
+proc setup_interactive_passes(ctx: RunContext) =
+   registerPass(ctx.graph, semPass)
+   registerPass(ctx.graph, evalPass)
 
 proc setup_vm_config_define(conf: ConfigRef) =
    initDefines(conf.symbols)
@@ -740,7 +740,8 @@ proc setup_vm_config_define(conf: ConfigRef) =
 
    undefSymbol(conf.symbols, "nimv2")
 
-proc setup_vm_config(ctx: RunContext, conf: ConfigRef) =
+proc setup_vm_config(ctx: RunContext) =
+   var conf = ctx.conf
    conf.searchPaths.add ctx.libpath.AbsoluteDir
    for p in ctx.libs:
       let p = p.AbsoluteDir
@@ -771,8 +772,9 @@ proc setup_vm_config(ctx: RunContext, conf: ConfigRef) =
 
    setup_vm_config_define(conf)
 
-proc create_script_vm(ctx: RunContext, graph: ModuleGraph): PCtx =
+proc create_script_vm(ctx: RunContext): PCtx =
    const name = "script"
+   var graph = ctx.graph
    var m = graph.makeModule(AbsoluteFile name)
    ctx.main_module = m
    ctx.idgen = idGeneratorFromModule(m)
@@ -782,17 +784,17 @@ proc create_script_vm(ctx: RunContext, graph: ModuleGraph): PCtx =
    graph.compileSystemModule()
    return vm
 
-proc set_stop_compile_handler(ctx: RunContext, graph: ModuleGraph) =
+proc set_stop_compile_handler(ctx: RunContext) =
    proc stop(): bool =
       ctx.conf.errorCounter >= ctx.max_compiler_errors
 
-   graph.doStopCompile = stop
+   ctx.graph.doStopCompile = stop
 
-proc load_preload_module(ctx: RunContext, graph: ModuleGraph) =
-   var conf = graph.config
+proc load_preload_module(ctx: RunContext) =
+   var conf = ctx.conf
 
-   if opt_check_failed_module_time.on:
-      ctx.options.excl opt_check_failed_module_time
+   if ctx.check_failed_module_time:
+      ctx.check_failed_module_time = false
       ctx.refresh_failed_module_with_last_mod_time()
 
    var pre_compile_module: seq[string]
@@ -808,7 +810,7 @@ proc load_preload_module(ctx: RunContext, graph: ModuleGraph) =
       if not is_failed_module(ctx, f):
          let mf = findFile(conf, f & ".nim")
          if not mf.isEmpty:
-            if not graph.safe_compile_module(ctx, mf):
+            if not safe_compile_module(ctx, mf):
                ctx.add_failed_module(f, mf.string)
                raise Reset()
             else:
@@ -823,46 +825,48 @@ proc load_preload_module(ctx: RunContext, graph: ModuleGraph) =
       ctx.pre_load_code = ""
 
 proc setup_compile_environment(ctx: RunContext) =
-   var graph = newModuleGraph(newIdentCache(), ctx.conf)
-   ctx.graph = graph
-   set_stop_compile_handler(ctx, graph)
-   setup_vm_config(ctx, ctx.conf)
+   set_stop_compile_handler(ctx)
+   setup_vm_config(ctx)
    setup_config_error_hook(ctx)
-   setup_interactive_passes(graph)
+   setup_interactive_passes(ctx)
 
-   var vm = create_script_vm(ctx, graph)
-   vm.register_custom_vmops(ctx, graph)
+   var vm = create_script_vm(ctx)
+   vm.register_custom_vmops(ctx)
 
 proc setup_vm_environment(ctx: RunContext) =
    setup_input_stream(ctx)
    setup_compile_environment(ctx)
-   load_preload_module(ctx, ctx.graph)
+   load_preload_module(ctx)
+
+proc reset_vm_state(ctx: RunContext) =
+   initStrTables(ctx.graph, ctx.main_module)
+   refresh(ctx.vm, ctx.main_module, ctx.idgen)
 
 proc run_repl(ctx: RunContext) =
-   setup_vm_environment(ctx)
-
-   # There is three type errors:
-   # 1. General syntax error, nothing to do, just ignore it.
-   # 2. The code or compiler raise exception, sometime code context
-   #    like global variable will polluted, so we need reload the code,
+   # There is three type of errors:
+   # 1. General syntax error, sometime it will make the sempass scope
+   #    context error, so maybe we need reload the code, there is option
+   #    to control this.
+   # 2. The code or compiler raise exception, it's happen rarely, but
+   #    maybe we need reload the code to prevent some error result,
    #    there is option to control this.
-   # 3. Error when import module, the vm enviroment is ruined almost,
+   # 3. Error when import module, the sem context is ruined almost,
    #    we need reset the vm, there is config to control reload code
-   #    or reset vm. But now, we will compile module first, so there
-   #    is no need to reload code or reset vm, anyway, you can still
-   #    reset the vm using command :r or :rs
+   #    or reset vm. But now, we will compile module first, if there is
+   #    error, we will no import the module, so there is no need to
+   #    reload code or reset vm, anyway, you can still reset the vm using
+   #    command :r or :rs
 
    while true:
       try:
          ctx.init()
-         let vm = cast[PCtx](ctx.graph.vm)
          ctx.graph.processModule(ctx.main_module, ctx.idgen, ctx.input_stream)
       except ResetError:
          break
       except ReloadError:
-         initStrTables(ctx.graph, ctx.main_module)
          discard
       except NilAccessDefect:
+         # now we treat NilAccessDefect same as general exception
          with_color(fgRed, false):
             stdout.write("Error: ")
          echo getCurrentExceptionMsg()
@@ -877,15 +881,18 @@ proc run_repl(ctx: RunContext) =
          if opt_exception_to_reset_module.on:
             break
 
-proc ctrl_c_proc() {.noconv.} =
-   sleep(100)
-   quit "CTRL-C pressed, quit."
+      # Reset the vm/module state when reload
+      reset_vm_state(ctx)
 
-proc main() =
+proc rebuild_vm_environment(ctx: RunContext) =
+   ctx.conf = newConfigRef()
+   ctx.graph = newModuleGraph(newIdentCache(), ctx.conf)
+   setup_vm_environment(ctx)
+
+proc set_options_from_command_line(ctx: RunContext) =
    var
       nimlib = ""
       imports: seq[string]
-      ctx = RunContext(max_compiler_errors: 5)
 
    template process_switch_on_off(o: RunOption, val: string) =
       block:
@@ -896,8 +903,6 @@ proc main() =
             ctx.options.excl o
          else:
             quit("Option value must be [on, off].")
-
-   ctx.options.incl {opt_error_to_reload_code, opt_auto_add_var}
 
    let argv = commandLineParams().mapIt((if it[0] == '-' and it.len >= 3 and it[1] != '-': "-" & it else: it))
    for kind, key, val in getopt(cmdline = argv):
@@ -956,10 +961,20 @@ proc main() =
    ctx.libs = libs
    ctx.imports = imports
 
+proc ctrl_c_proc() {.noconv.} =
+   sleep(100)
+   quit "CTRL-C pressed, quit."
+
+proc main() =
+   var ctx = RunContext(max_compiler_errors: 5)
+   ctx.options.incl {opt_error_to_reload_code, opt_auto_add_var}
+
+   set_options_from_command_line(ctx)
    set_control_chook(ctrl_c_proc)
    while true:
       try:
-         ctx.conf = newConfigRef()
+         # When reset, code goes here, we will rebuild the vm environment
+         rebuild_vm_environment(ctx)
          run_repl(ctx)
       except:
          discard
