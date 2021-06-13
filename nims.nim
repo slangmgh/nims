@@ -71,6 +71,8 @@ type
       pre_load_code: string
       input_lines_good: seq[string]
 
+      saved_stdout: FileHandle
+
 proc init(ctx: RunContext) =
    ctx.last_line_need_reset = false
    ctx.last_line_has_error = false
@@ -174,14 +176,6 @@ const
 
 func is_import_line(s: string): bool =
    s.startsWith(sImport) or s.startsWith(sFrom) or s.startsWith(sInclue)
-
-proc disable_stdout() =
-   const device = when defined(windows): "NUL" else: "/dev/null"
-   discard reopen(stdout, device, fmWrite)
-
-proc enable_stdout() =
-   const device = when defined(windows): "CON" else: "/dev/tty"
-   discard reopen(stdout, device, fmWrite)
 
 proc get_prompt(indent_level, line_no: int): string =
    let prompt_str = if indent_level == 0: ">>> " else: ">++ "
@@ -506,17 +500,37 @@ proc my_read_line(ctx: RunContext): string =
 
    return buffer
 
+when defined(windows):
+   proc c_dup(oldfd: FileHandle): FileHandle {.importc: "_dup", header: "<io.h>".}
+   proc c_dup2(oldfd: FileHandle, newfd: FileHandle): cint {.importc: "_dup2", header: "<io.h>".}
+else:
+   proc c_dup(oldfd: FileHandle): FileHandle{.importc: "dup", header: "<unistd.h>".}
+   proc c_dup2(oldfd: FileHandle, newfd: FileHandle): cint {.importc: "dup2", header: "<unistd.h>".}
+
+proc disable_stdout(ctx: RunContext) =
+   const device = when defined(windows): "NUL" else: "/dev/null"
+   ctx.saved_stdout = c_dup(stdout.getFileHandle)
+   discard reopen(stdout, device, fmWrite)
+
+proc enable_stdout(ctx: RunContext) =
+   if ctx.saved_stdout != FileHandle(-1):
+      discard c_dup2(ctx.saved_stdout, stdout.getFileHandle)
+      ctx.saved_stdout = FileHandle(-1)
+   else:
+      const device = when defined(windows): "CON" else: "/dev/tty"
+      discard reopen(stdout, device, fmWrite)
+
 proc my_msg_writeln_hook(msg: string) =
    discard
 
-proc disable_output(conf: ConfigRef) =
-   conf.writelnHook = my_msg_writeln_hook
-   disable_stdout()
+proc disable_output(ctx: RunContext) =
+   ctx.conf.writelnHook = my_msg_writeln_hook
+   disable_stdout(ctx)
 
-proc enable_output(conf: ConfigRef) =
-   if not conf.writelnHook.isNil:
-      conf.writelnHook = nil
-      enable_stdout()
+proc enable_output(ctx: RunContext) =
+   if not ctx.conf.writelnHook.isNil:
+      ctx.conf.writelnHook = nil
+      enable_stdout(ctx)
 
 proc get_line(ctx: RunContext): string =
    if ctx.last_line_need_reset:
@@ -548,7 +562,7 @@ proc get_line(ctx: RunContext): string =
          # not always true of cause.
 
          ctx.last_input_line = ""
-         disable_output(ctx.conf)
+         disable_output(ctx)
          return "echo \" \""
 
    if ctx.last_input_line != "":
@@ -654,7 +668,7 @@ proc check_var_set_value(ctx: RunContext): bool =
 proc setup_input_stream(ctx: RunContext) =
    proc llReadFromStdin(s: PLLStream, buf: pointer, bufLen: int): int =
       # Ensure the output is fine
-      enable_output(ctx.conf)
+      enable_output(ctx)
 
       s.rd = 0
       if s.lineOffset < 0:
@@ -671,7 +685,7 @@ proc setup_input_stream(ctx: RunContext) =
          # When the code reloaded or vm reset, we need to re-execute the saved code,
          # at this time, we should disable output, or else the output will confuse
          # the user.
-         disable_output(ctx.conf)
+         disable_output(ctx)
       else:
          s.s = get_line(ctx)
          ctx.last_line_is_import = ctx.last_input_line.is_import_line
@@ -1016,7 +1030,7 @@ proc ctrl_c_proc() {.noconv.} =
    quit "CTRL-C pressed, quit."
 
 proc main() =
-   var ctx = RunContext(max_compiler_errors: 5)
+   var ctx = RunContext(max_compiler_errors: 5, saved_stdout: FileHandle(-1))
    ctx.options.incl {opt_error_to_reload_code, opt_auto_add_var}
 
    set_options_from_command_line(ctx)
