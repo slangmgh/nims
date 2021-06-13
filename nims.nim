@@ -503,18 +503,23 @@ proc my_read_line(ctx: RunContext): string =
 when defined(windows):
    proc c_dup(oldfd: FileHandle): FileHandle {.importc: "_dup", header: "<io.h>".}
    proc c_dup2(oldfd: FileHandle, newfd: FileHandle): cint {.importc: "_dup2", header: "<io.h>".}
+   proc c_close(fd: FileHandle): cint {.importc: "_close", header: "<io.h>".}
 else:
-   proc c_dup(oldfd: FileHandle): FileHandle{.importc: "dup", header: "<unistd.h>".}
+   proc c_dup(oldfd: FileHandle): FileHandle {.importc: "dup", header: "<unistd.h>".}
    proc c_dup2(oldfd: FileHandle, newfd: FileHandle): cint {.importc: "dup2", header: "<unistd.h>".}
+   proc c_close(fd: FileHandle): cint {.importc: "close", header: "<unistd.h>".}
 
 proc disable_stdout(ctx: RunContext) =
    const device = when defined(windows): "NUL" else: "/dev/null"
    ctx.saved_stdout = c_dup(stdout.getFileHandle)
    discard reopen(stdout, device, fmWrite)
+   flushFile(stdout)
 
 proc enable_stdout(ctx: RunContext) =
    if ctx.saved_stdout != FileHandle(-1):
       discard c_dup2(ctx.saved_stdout, stdout.getFileHandle)
+      flushFile(stdout)
+      discard c_close(ctx.saved_stdout)
       ctx.saved_stdout = FileHandle(-1)
    else:
       const device = when defined(windows): "CON" else: "/dev/tty"
