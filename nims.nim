@@ -72,6 +72,7 @@ type
       input_lines_good: seq[string]
 
       saved_stdout: FileHandle
+      saved_stderr: FileHandle
 
 proc init(ctx: RunContext) =
    ctx.last_line_need_reset = false
@@ -248,9 +249,13 @@ proc is_var_exists(graph: ModuleGraph, m: PSym, name: string): bool =
 proc readLineFromStdin(ctx: RunContext, prompt: string): (string, bool) =
    let time_start = cpuTime()
    stdout.write(prompt)
+
    # We must use flush to ensure the output is visible, becasue after
    # redirect, without newline, the text may not be flush to the console
+   # Because we already use non buffered stdout, so it is no need to call
+   # flush, but anyway, call it do no harm.
    flushFile(stdout)
+
    let s = readLine(stdin)
    let time_end = cpuTime()
    let is_paste =
@@ -513,26 +518,41 @@ else:
    proc c_close(fd: FileHandle): cint {.importc: "close", header: "<unistd.h>".}
 
 var IOLBF {.importc: "_IOLBF", nodecl, header: "<stdio.h>".}: cint
+var IONBF {.importc: "_IONBF", nodecl, header: "<stdio.h>".}: cint
 proc c_setvbuf(f: File, buf: pointer, mode: cint, size: csize_t): cint {.
   importc: "setvbuf", header: "<stdio.h>", tags: [].}
 
 proc disable_stdout(ctx: RunContext) =
    const device = when defined(windows): "NUL:" else: "/dev/null"
-   ctx.saved_stdout = c_dup(stdout.getFileHandle)
-   discard reopen(stdout, device, fmWrite)
-   # We cannot call setStdIoUnbuffered, because the doskey function of cmd.exe will
-   # close console and make the program in dead cycle
-   flushFile(stdout)
+   template do_with(con: untyped) =
+      ctx.`saved con` = c_dup(con.getFileHandle)
+      discard reopen(con, device, fmWrite)
+
+      # Set the stdout/stderr to no buffer, so stdout.write need not flush to display
+      discard c_setvbuf(con, nil, IONBF, 0)
+      flushFile(con)
+
+   # We cannot call setStdIoUnbuffered, because set stdin to unbuffered
+   # will make the program close console and run in dead cycle after using doskey F7/F8
+   # function with cmd.exe.
+
+   do_with(stdout)
+   do_with(stderr)
 
 proc enable_stdout(ctx: RunContext) =
-   if ctx.saved_stdout != FileHandle(-1):
-      discard c_dup2(ctx.saved_stdout, stdout.getFileHandle)
-      flushFile(stdout)
-      discard c_close(ctx.saved_stdout)
-      ctx.saved_stdout = FileHandle(-1)
-   else:
-      const device = when defined(windows): "CON:" else: "/dev/tty"
-      discard reopen(stdout, device, fmWrite)
+   const device = when defined(windows): "CON:" else: "/dev/tty"
+
+   template do_with(con: untyped) =
+      if ctx.`saved con` != FileHandle(-1):
+         discard c_dup2(ctx.`saved con`, con.getFileHandle)
+         flushFile(con)
+         discard c_close(ctx.`saved con`)
+         ctx.`saved con` = FileHandle(-1)
+      else:
+         discard reopen(con, device, fmWrite)
+
+   do_with(stdout)
+   do_with(stderr)
 
 proc my_msg_writeln_hook(msg: string) =
    discard
