@@ -248,6 +248,9 @@ proc is_var_exists(graph: ModuleGraph, m: PSym, name: string): bool =
 proc readLineFromStdin(ctx: RunContext, prompt: string): (string, bool) =
    let time_start = cpuTime()
    stdout.write(prompt)
+   # We must use flush to ensure the output is visible, becasue after
+   # redirect, without newline, the text may not be flush to the console
+   flushFile(stdout)
    let s = readLine(stdin)
    let time_end = cpuTime()
    let is_paste =
@@ -509,10 +512,16 @@ else:
    proc c_dup2(oldfd: FileHandle, newfd: FileHandle): cint {.importc: "dup2", header: "<unistd.h>".}
    proc c_close(fd: FileHandle): cint {.importc: "close", header: "<unistd.h>".}
 
+var IOLBF {.importc: "_IOLBF", nodecl, header: "<stdio.h>".}: cint
+proc c_setvbuf(f: File, buf: pointer, mode: cint, size: csize_t): cint {.
+  importc: "setvbuf", header: "<stdio.h>", tags: [].}
+
 proc disable_stdout(ctx: RunContext) =
-   const device = when defined(windows): "NUL" else: "/dev/null"
+   const device = when defined(windows): "NUL:" else: "/dev/null"
    ctx.saved_stdout = c_dup(stdout.getFileHandle)
    discard reopen(stdout, device, fmWrite)
+   # We cannot call setStdIoUnbuffered, because the doskey function of cmd.exe will
+   # close console and make the program in dead cycle
    flushFile(stdout)
 
 proc enable_stdout(ctx: RunContext) =
@@ -522,7 +531,7 @@ proc enable_stdout(ctx: RunContext) =
       discard c_close(ctx.saved_stdout)
       ctx.saved_stdout = FileHandle(-1)
    else:
-      const device = when defined(windows): "CON" else: "/dev/tty"
+      const device = when defined(windows): "CON:" else: "/dev/tty"
       discard reopen(stdout, device, fmWrite)
 
 proc my_msg_writeln_hook(msg: string) =
