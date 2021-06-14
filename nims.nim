@@ -40,7 +40,7 @@ type
       opt_exception_to_reset_module
       opt_import_error_to_reset_module
       opt_error_to_reload_code
-      opt_auto_add_var
+      opt_auto_create_var
       opt_paste_by_input_time_elapse
       opt_paste_mode
 
@@ -367,9 +367,9 @@ proc my_read_line(ctx: RunContext): string =
                   if opt_save_nims_code.on:
                      save_nims_cache_file(ctx.input_lines_good)
       of "auto-create-var", "acv":
-         ctx.toggle_option(opt_auto_add_var)
+         ctx.toggle_option(opt_auto_create_var)
          with_color(fgCyan, false):
-            echo "Auto create variable(acv) " & opt_auto_add_var.onoff
+            echo "Auto create variable(acv) " & opt_auto_create_var.onoff
       of "error-to-reload", "setr", "sem":
          ctx.toggle_option(opt_error_to_reload_code)
          with_color(fgCyan, false):
@@ -387,7 +387,7 @@ proc my_read_line(ctx: RunContext): string =
             echo "Syntax error to reload mode(setr): " & opt_error_to_reload_code.onoff
             echo "Exception error to reset mode(eetr): " & opt_exception_to_reset_module.onoff
             echo "Import error to reset mode(ietr): " & opt_import_error_to_reset_module.onoff
-            echo "Auto create variable(acv): " & opt_auto_add_var.onoff
+            echo "Auto create variable(acv): " & opt_auto_create_var.onoff
             echo "Auto save/load script code(asc): " & opt_save_nims_code.onoff
             echo "Paste according to input time elapse(pte): " & opt_paste_by_input_time_elapse.onoff
             echo "Paste mode(p): " & opt_paste_mode.onoff
@@ -692,7 +692,7 @@ proc check_var_set_value(ctx: RunContext): bool =
             if is_var_exists(ctx.graph, ctx.main_module, v):
                ctx.last_input_line = ctx.last_input_line[4..^1].strip(trailing = false)
                return true
-   elif opt_auto_add_var.on and ctx.last_input_line.find('=') >= 0:
+   elif opt_auto_create_var.on and ctx.last_input_line.find('=') >= 0:
       let v = ctx.last_input_line.split('=')[0].strip
       if v.validIdentifier and not is_var_exists(ctx.graph, ctx.main_module, v):
          ctx.last_input_line = "var " & ctx.last_input_line
@@ -1023,8 +1023,8 @@ proc set_options_from_command_line(ctx: RunContext) =
             process_switch_on_off(opt_exception_to_reset_module, val)
          of "error-to-reload":
             process_switch_on_off(opt_error_to_reload_code, val)
-         of "auto-add-var":
-            process_switch_on_off(opt_auto_add_var, val)
+         of "auto-create-var":
+            process_switch_on_off(opt_auto_create_var, val)
          of "verbose":
             process_switch_on_off(opt_verbose, val)
          of "max-compiler-errors":
@@ -1065,7 +1065,7 @@ proc ctrl_c_proc() {.noconv.} =
 
 proc main() =
    var ctx = RunContext(max_compiler_errors: 5, saved_stdout: FileHandle(-1))
-   ctx.options.incl {opt_error_to_reload_code, opt_auto_add_var}
+   ctx.options.incl {opt_error_to_reload_code, opt_auto_create_var}
 
    set_options_from_command_line(ctx)
    set_control_chook(ctrl_c_proc)
