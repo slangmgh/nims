@@ -22,6 +22,7 @@ const my_special_vmops = defined(myvmops)
 
 when my_special_vmops:
    import httputils, guessencoding
+   import winutils
 
 const
    indent_oprs = {'=', ':', '+', '-', '*', '/', '\\', '<', '>', '!', '?', '^',
@@ -81,6 +82,7 @@ proc init(ctx: RunContext) =
    ctx.last_input_line = ""
    if not ctx.input_stream.isNil:
       ctx.input_stream.lineOffset = -1
+      ctx.input_stream.s = ""
 
 proc vm(ctx: RunContext): PCtx = PCtx ctx.graph.vm
 
@@ -93,6 +95,16 @@ proc copy(ctx: RunContext): RunContext =
       failed_imports: ctx.failed_imports,
       scriptapi_import: ctx.scriptapi_import
    )
+
+template process_switch_on_off(o: RunOption, val: string) =
+   block:
+      let s = if val == "": "on" else: val
+      if s in ["on", "1"]:
+         ctx.options.incl o
+      elif s in ["off", "0"]:
+         ctx.options.excl o
+      else:
+         echo "Option value must be 'on' or 'off'."
 
 template on(o: RunOption): bool = o in ctx.options
 
@@ -186,8 +198,13 @@ proc show_raw_buffer(buffer: string, header: string) =
    with_color(fgCyan, false):
       echo header.center(70, '-')
 
-   with_color(fgYellow, false):
-      echo buffer.strip(leading = false)
+   var lineno = 1
+   for s in buffer.strip.splitLines:
+      with_color(fgCyan, false):
+         stdout.write(&"{($lineno & \".\"):<4}")
+      with_color(fgYellow, false):
+         echo s
+      inc(lineno)
 
    with_color(fgCyan, false):
       echo '-'.repeat(70)
@@ -260,7 +277,14 @@ proc readLineFromStdin(ctx: RunContext, prompt: string): (string, bool) =
    let time_end = cpuTime()
    let is_paste =
       if opt_paste_by_input_time_elapse.on:
-         time_end - time_start < 0.08
+         when my_special_vmops:
+            let hwnd = find_window("TPHotkeyMain", visible = false)
+            if not hwnd.isNil and send_message(hwnd, WM_USER + 11, 0, 0) == 2:
+               true
+            else:
+               time_end - time_start < 0.08
+         else:
+            time_end - time_start < 0.08
       else:
          false
    (s, is_paste)
@@ -270,9 +294,10 @@ proc readLineFromStdin(ctx: RunContext, prompt: string): (string, bool) =
 ## it is used to paste code to terminal
 ##
 ## paste mode is triggered at following situation:
-## 1. use :paste command
-## 2. When the readLine call take very small time, less than 0.08 seconds
-## 3. When the line has comment line, first char is '#'
+## 1. use :paste command, must using :go to execute code
+## 2. The code starts with '#', must using :go to execute code
+## 3. When the readLine call take very small time, less than 0.08 seconds
+##    Using paste-by-time-elapse to enable it
 ##
 
 proc my_read_line(ctx: RunContext): string =
@@ -296,35 +321,44 @@ proc my_read_line(ctx: RunContext): string =
       case cmd
       of "help", "h":
          with_color(fgCyan, false):
-            echo ":help, :h                : Show help."
-            echo ":clear, :c NUM           : Clear the last NUM line or all codes."
-            echo ":keep, :k NUM            : Keep the first NUM like codes."
-            echo ":show, :s                : Show the current code in buffer."
-            echo ":paste, :p               : Toggle the paste mode."
-            echo ":cache                   : Toggle the auto save/load the script codes."
-            echo ":auto-create-var         : Toggle auto create var when not exist."
-            echo ":error-to-reload         : Toggle syntax error to reload mode."
-            echo ":max-errors NUM          : Set max compiler errors to NUM."
-            echo ":option, :o              : Show current options."
-            echo ":reload, :r              : Reload the code manually."
-            echo ":reset, :rr              : Reset the vm to manually."
-            echo ":exit, :q, :x            : Exit the program."
+            echo ":help, :h                  : Show help."
+            echo ":clear, :c NUM             : Clear the last NUM line or all codes."
+            echo ":keep, :k NUM              : Keep the first NUM like codes."
+            echo ":show, :s                  : Show the current code in buffer."
+            echo ":paste, :p [on|off]        : Show/toggle the paste mode."
+            echo ":cache [on|off]            : Show/toggle the auto save/load the script codes."
+            echo ":auto-create-var [on|off]  : Show/toggle auto create var when not exist."
+            echo ":error-to-reload [on|off]  : Show/toggle syntax error to reload mode."
+            echo ":max-errors [NUM]          : Show/set max compiler errors to NUM."
+            echo ":option, :o                : Show current options."
+            echo ":reload, :r                : Reload the code manually."
+            echo ":reset, :rr                : Reset the vm to manually."
+            echo ":go                        : Execute code in paste mode."
+            echo ":exit, :q, :x              : Exit the program."
       of "exit", "quit", "q", "x":
          quit()
+      of "go":
+         return buffer
       of "verbose", "v", "d":
-         ctx.toggle_option(opt_verbose)
+         if cmds.len > 1:
+            process_switch_on_off(opt_verbose, cmds[1])
          with_color(fgCyan, false):
             echo "Verbose mode is " & opt_verbose.onoff
       of "paste-by-time-elapse", "pte", "tep":
-         ctx.toggle_option(opt_paste_by_input_time_elapse)
+         if cmds.len > 1:
+            process_switch_on_off(opt_paste_by_input_time_elapse, cmds[1])
          with_color(fgCyan, false):
             echo "Paste according to input time elapse(pte): " & opt_paste_by_input_time_elapse.onoff
       of "paste", "p":
-         ctx.toggle_option(opt_paste_mode)
+         if cmds.len > 1:
+            process_switch_on_off(opt_paste_mode, cmds[1])
          with_color(fgCyan, false):
             echo "Paste mode(p): " & opt_paste_mode.onoff
+            if opt_paste_mode.on:
+               echo "Please input command ':go' to execute code."
       of "auto-save-code", "asc", "cache":
-         ctx.toggle_option(opt_save_nims_code)
+         if cmds.len > 1:
+            process_switch_on_off(opt_save_nims_code, cmds[1])
          with_color(fgCyan, false):
             echo "Auto save/load script code(asc): " & opt_save_nims_code.onoff
       of "show", "s":
@@ -336,6 +370,7 @@ proc my_read_line(ctx: RunContext): string =
             echo "Max compiler errors(me): " & $ctx.max_compiler_errors
       of "clean", "clear", "c":
          if ctx.input_lines_good.len > 0:
+            ctx.input_lines_good = ctx.input_lines_good.join("").strip.split_lines.mapIt(it & "\p")
             let clear_line_count = argn(1, -1)
             if clear_line_count < 0 or clear_line_count >= ctx.input_lines_good.len:
                ctx.input_lines_good = @[]
@@ -352,6 +387,7 @@ proc my_read_line(ctx: RunContext): string =
                   save_nims_cache_file(ctx.input_lines_good)
       of "keep", "k":
          if ctx.input_lines_good.len > 0:
+            ctx.input_lines_good = ctx.input_lines_good.join("").strip.split_lines.mapIt(it & "\p")
             var keep_line_count = argn(1, -1)
             if keep_line_count == 0:
                ctx.input_lines_good = @[]
@@ -361,25 +397,29 @@ proc my_read_line(ctx: RunContext): string =
                if opt_save_nims_code.on:
                   save_nims_cache_file(ctx.input_lines_good)
             elif keep_line_count > 0 and keep_line_count < ctx.input_lines_good.len:
-                  ctx.input_lines_good = ctx.input_lines_good[0..(keep_line_count-1)]
-                  show_raw_buffer(ctx.input_lines_good.join(""), "Current buffer")
+               ctx.input_lines_good = ctx.input_lines_good[0..(keep_line_count-1)]
+               show_raw_buffer(ctx.input_lines_good.join(""), "Current buffer")
 
-                  if opt_save_nims_code.on:
-                     save_nims_cache_file(ctx.input_lines_good)
+               if opt_save_nims_code.on:
+                  save_nims_cache_file(ctx.input_lines_good)
       of "auto-create-var", "acv":
-         ctx.toggle_option(opt_auto_create_var)
+         if cmds.len > 1:
+            process_switch_on_off(opt_auto_create_var, cmds[1])
          with_color(fgCyan, false):
             echo "Auto create variable(acv) " & opt_auto_create_var.onoff
       of "error-to-reload", "setr", "sem":
-         ctx.toggle_option(opt_error_to_reload_code)
+         if cmds.len > 1:
+            process_switch_on_off(opt_error_to_reload_code, cmds[1])
          with_color(fgCyan, false):
             echo "Syntax error to reload mode(setr) " & opt_error_to_reload_code.onoff
       of "except-to-reset", "eetr", "eem":
-         ctx.toggle_option(opt_exception_to_reset_module)
+         if cmds.len > 1:
+            process_switch_on_off(opt_exception_to_reset_module, cmds[1])
          with_color(fgCyan, false):
             echo "Exception error to reset mode(eetr): " & opt_exception_to_reset_module.onoff
       of "import-error-to-reset", "ietr", "iem":
-         ctx.toggle_option(opt_import_error_to_reset_module)
+         if cmds.len > 1:
+            process_switch_on_off(opt_import_error_to_reset_module, cmds[1])
          with_color(fgCyan, false):
             echo "Import error to reset mode(ietr): " & opt_import_error_to_reset_module.onoff
       of "options", "option", "o":
@@ -454,22 +494,15 @@ proc my_read_line(ctx: RunContext): string =
       indent_level = 0
       triples = 0
       line_no = 1
-      paste_mode = opt_paste_mode.on
+      manual_paste_mode = false
+
+   const cmds_no_colon = ["help", "go", "exit", "quit", "reload", "reset", "option"]
 
    while true:
-      var (myline, is_paste) = readLineFromStdin(ctx, get_prompt(indent_level, line_no))
+      var (myline, is_time_elapse_paste) = readLineFromStdin(ctx, get_prompt(indent_level, line_no))
 
-      if paste_mode:
-         add_line()
-         continue
-
-      if buffer == "" and myline.len > 0 and myline[0] == '#':
-         paste_mode = true
-         continue
-
-      if is_paste:
-         add_line()
-         continue
+      if myline in cmds_no_colon:
+         myline = ":" & myline
 
       let cmds = myline.replace(',', ' ').splitWhitespace
       if cmds.len > 0 and cmds[0].len > 0:
@@ -482,6 +515,21 @@ proc my_read_line(ctx: RunContext): string =
             continue
          else:
             discard
+
+      if manual_paste_mode or opt_paste_mode.on:
+         add_line()
+         continue
+
+      if buffer == "" and myline.len > 0 and myline[0] == '#':
+         with_color(fgCyan, false):
+            echo "In one-time paste mode."
+            echo "Please input command ':go' to execute code."
+         manual_paste_mode = true
+         continue
+
+      if is_time_elapse_paste:
+         add_line()
+         continue
 
       inc triples, count_triples(myline)
       let in_triple_string = (triples and 1) == 1
@@ -924,6 +972,7 @@ proc run_repl(ctx: RunContext) =
    while true:
       try:
          ctx.init()
+         reinit_vm_state(ctx)
          ctx.graph.processModule(ctx.main_module, ctx.idgen, ctx.input_stream)
       except ResetError:
          break
@@ -985,16 +1034,6 @@ proc set_options_from_command_line(ctx: RunContext) =
       nimlib = ""
       modules: seq[string]
       paths: seq[string]
-
-   template process_switch_on_off(o: RunOption, val: string) =
-      block:
-         let s = if val == "": "on" else: val
-         if s == "on":
-            ctx.options.incl o
-         elif s == "off":
-            ctx.options.excl o
-         else:
-            quit("Option value must be 'on' or 'off'.")
 
    let argv = commandLineParams().mapIt((if it[0] == '-' and it.len >= 3 and it[1] != '-': "-" & it else: it))
    for kind, key, val in getopt(cmdline = argv):
@@ -1066,6 +1105,8 @@ proc ctrl_c_proc() {.noconv.} =
 proc main() =
    var ctx = RunContext(max_compiler_errors: 5, saved_stdout: FileHandle(-1))
    ctx.options.incl {opt_error_to_reload_code, opt_auto_create_var}
+   when my_special_vmops:
+      ctx.options.incl {opt_paste_by_input_time_elapse}
 
    set_options_from_command_line(ctx)
    set_control_chook(ctrl_c_proc)
