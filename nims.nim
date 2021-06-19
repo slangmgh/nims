@@ -9,7 +9,7 @@
 ## >>> nim c -d:release -d:nimcore nims.nim
 ##
 
-import os, terminal, strutils, sequtils, times, macros, strformat, parseopt
+import os, terminal, strutils, sequtils, times, macros, strformat, parseopt, math
 import "../../compiler" / [ast, astalgo, modules, passes, condsyms,
        options, sem, semdata, llstream, vm, vmdef, nimeval, lineinfos, msgs,
        modulegraphs, idents, pathutils, passaux, scriptconfig, parser]
@@ -22,7 +22,8 @@ const my_special_vmops = defined(myvmops)
 
 when my_special_vmops:
    import httputils, guessencoding
-   import winutils
+   when defined(vcc):
+      import winutils
 
 const
    indent_oprs = {'=', ':', '+', '-', '*', '/', '\\', '<', '>', '!', '?', '^',
@@ -66,7 +67,6 @@ type
       last_input_line: string
       last_line_is_import: bool
       last_line_has_error: bool
-      last_line_need_reset: bool
       check_failed_module_time: bool
 
       pre_load_code: string
@@ -76,13 +76,15 @@ type
       saved_stderr: FileHandle
 
 proc init(ctx: RunContext) =
-   ctx.last_line_need_reset = false
    ctx.last_line_has_error = false
    ctx.last_line_is_import = false
    ctx.last_input_line = ""
    if not ctx.input_stream.isNil:
       ctx.input_stream.lineOffset = -1
       ctx.input_stream.s = ""
+
+func cur_code_line_count(ctx: RunContext): int =
+   ctx.input_lines_good.mapIt(it.count('\n')).sum
 
 proc vm(ctx: RunContext): PCtx = PCtx ctx.graph.vm
 
@@ -277,7 +279,7 @@ proc readLineFromStdin(ctx: RunContext, prompt: string): (string, bool) =
    let time_end = cpuTime()
    let is_paste =
       if opt_paste_by_input_time_elapse.on:
-         when my_special_vmops:
+         when my_special_vmops and defined(vcc):
             let hwnd = find_window("TPHotkeyMain", visible = false)
             if not hwnd.isNil and send_message(hwnd, WM_USER + 11, 0, 0) == 2:
                true
@@ -493,11 +495,11 @@ proc my_read_line(ctx: RunContext): string =
       buffer = ""
       indent_level = 0
       triples = 0
-      line_no = 1
       manual_paste_mode = false
 
    const cmds_no_colon = ["help", "go", "exit", "quit", "reload", "reset", "option"]
 
+   var line_no = ctx.cur_code_line_count + 1
    while true:
       var (myline, is_time_elapse_paste) = readLineFromStdin(ctx, get_prompt(indent_level, line_no))
 
@@ -615,24 +617,22 @@ proc enable_output(ctx: RunContext) =
       enable_stdout(ctx)
 
 proc get_line(ctx: RunContext): string =
-   if ctx.last_line_need_reset:
-      # When error on import, we need to reset the VM or reload the code
-      # according the config option.
-      #
-      # If we compile module before import, this code will never be
-      # triggered, because import always successful.
-
-      ctx.last_line_need_reset = false
-
-      if opt_import_error_to_reset_module.on:
-         raise Reset()
-      else:
-         raise Reload()
-
    if ctx.last_line_has_error:
       ctx.last_line_has_error = false
 
-      if opt_error_to_reload_code.on or
+      if ctx.last_line_is_import:
+         # When error on import, we need to reset the VM or reload the code
+         # according the config option.
+         #
+         # If we compile module before import, this code will never be
+         # triggered, because import always successful.
+
+         if opt_import_error_to_reset_module.on:
+            raise Reset()
+         else:
+            raise Reload()
+
+      elif opt_error_to_reload_code.on or
          ctx.last_input_line.startsWith("var ") or ctx.last_input_line.startsWith("let "):
          # Sometime syntax error will make scope context error, so maybe we need reload
          ctx.last_input_line = ""
@@ -777,10 +777,7 @@ proc setup_input_stream(ctx: RunContext) =
          elif check_var_set_value(ctx):
             s.s = ctx.last_input_line
 
-      # Set the lineOffset to 0, so the syntax error's line number will be same
-      # with the line number in input prompt
-      s.lineOffset = 0
-
+      s.lineOffset = ctx.cur_code_line_count
       reinit_vm_state(ctx)
 
       result = min(bufLen, s.s.len - s.rd)
@@ -793,19 +790,11 @@ proc setup_input_stream(ctx: RunContext) =
 proc setup_config_error_hook(ctx: RunContext) =
    proc on_compile_error(conf: ConfigRef; info: TLineInfo; msg: string; severity: Severity) {.gcsafe.} =
       if severity == Error and conf.m.errorOutputs.len != 0:
-         if ctx.last_line_is_import:
-            # When import error occured, the VM environment will be ruined,
-            # so we need reset the VM environment, we set flag here untill
-            # some errors displayed
-            ctx.last_line_need_reset = true
-
-            # If we compile module before import, this code will never be
-            # triggered, because import always successful
-            if conf.errorCounter >= ctx.max_compiler_errors:
-               with_color(fgRed, false):
-                  echo "Too many error occured, skip..."
-         else:
-            ctx.last_line_has_error = true
+         ctx.last_line_has_error = true
+         if conf.errorCounter >= ctx.max_compiler_errors:
+            with_color(fgRed, false):
+               echo "Too many error occured, skip..."
+            disable_output(ctx)
 
    ctx.conf.structuredErrorHook = on_compile_error
 
