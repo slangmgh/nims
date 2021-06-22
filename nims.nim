@@ -291,6 +291,29 @@ proc readLineFromStdin(ctx: RunContext, prompt: string): (string, bool) =
          false
    (s, is_paste)
 
+func unindent_buffer(buffer: string): string =
+   var indent_space = 0
+   for c in buffer:
+      if c == ' ':
+         inc(indent_space)
+      else:
+         break
+
+   var lines: seq[string]
+   for line in buffer.splitLines:
+      var cnt = 0
+      for c in line:
+         if c == ' ' and cnt < indent_space:
+            inc(cnt)
+         else:
+            break
+      if cnt > 0:
+         lines.add line[cnt .. ^1]
+      else:
+         lines.add line
+
+   lines.join("\p")
+
 ## paste mode
 ## don't do any indent, add the code directly
 ## it is used to paste code to terminal
@@ -310,8 +333,8 @@ proc my_read_line(ctx: RunContext): string =
          else: parseFloat(cmds[n])
       else: v
 
-   template add_line() =
-      if buffer == "":
+   template add_line(raw = false) =
+      if buffer == "" and not raw:
          buffer &= myline.strip(trailing = false) & "\p"
       else:
          buffer &= myline & "\p"
@@ -340,7 +363,7 @@ proc my_read_line(ctx: RunContext): string =
       of "exit", "quit", "q", "x":
          quit()
       of "go":
-         return buffer
+         break
       of "verbose", "v", "d":
          if cmds.len > 1:
             process_switch_on_off(opt_verbose, cmds[1])
@@ -519,7 +542,7 @@ proc my_read_line(ctx: RunContext): string =
             discard
 
       if manual_paste_mode or opt_paste_mode.on:
-         add_line()
+         add_line(true)
          continue
 
       if buffer == "" and myline.len > 0 and myline[0] == '#':
@@ -530,7 +553,7 @@ proc my_read_line(ctx: RunContext): string =
          continue
 
       if is_time_elapse_paste:
-         add_line()
+         add_line(true)
          continue
 
       inc triples, count_triples(myline)
@@ -552,6 +575,9 @@ proc my_read_line(ctx: RunContext): string =
 
       if indent_level == 0 and buffer != "" and (not need_continue) and (not in_triple_string):
          break
+
+   if buffer.len > 0 and buffer[0] == ' ':
+      buffer = unindent_buffer(buffer)
 
    if opt_verbose.on:
       show_raw_buffer(buffer, "Line buffer")
