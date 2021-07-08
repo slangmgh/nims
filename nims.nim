@@ -607,40 +607,45 @@ var IONBF {.importc: "_IONBF", nodecl, header: "<stdio.h>".}: cint
 proc c_setvbuf(f: File, buf: pointer, mode: cint, size: csize_t): cint {.
   importc: "setvbuf", header: "<stdio.h>", tags: [].}
 
-proc disable_output(ctx: RunContext) =
+proc redirect_console_to_nul(con: File): FileHandle =
    const device = when defined(windows): "NUL:" else: "/dev/null"
+   result = c_dup(con.getFileHandle)
+   discard reopen(con, device, fmWrite)
 
-   template do_with(con: untyped) =
-      if ctx.`saved con` == FileHandle(-1):
-         ctx.`saved con` = c_dup(con.getFileHandle)
-         discard reopen(con, device, fmWrite)
-
-         # Set the stdout/stderr to no buffer, so stdout.write need not flush to display
-         discard c_setvbuf(con, nil, IONBF, 0)
-         flushFile(con)
-
+   # Set the stdout/stderr to no buffer, so stdout.write need not flush to display
+   #
    # We cannot call setStdIoUnbuffered, because set stdin to unbuffered
    # will make the program close console and run in dead cycle after using doskey F7/F8
    # function with cmd.exe.
 
+   discard c_setvbuf(con, nil, IONBF, 0)
+   flushFile(con)
+
+proc redirect_console_back_to(con: File, f: FileHandle) =
+   # dup2(old, new: FileHandle)
+   # Force the new handle refer to the same file as the old handle
+   discard c_dup2(f, con.getFileHandle)
+   flushFile(con)
+   discard c_setvbuf(con, nil, IONBF, 0)
+   resetAttributes()
+   discard c_close(f)
+
+proc disable_output(ctx: RunContext) =
+   const device = when defined(windows): "NUL:" else: "/dev/null"
+
    if not ctx.con_dup:
-      do_with(stdout)
-      do_with(stderr)
+      ctx.saved_stdout = redirect_console_to_nul(stdout)
+      ctx.saved_stderr = redirect_console_to_nul(stderr)
       ctx.con_dup = true
 
 proc enable_output(ctx: RunContext) =
    const device = when defined(windows): "CON:" else: "/dev/tty"
 
-   template do_with(con: untyped) =
-      if ctx.`saved con` != FileHandle(-1):
-         discard c_dup2(ctx.`saved con`, con.getFileHandle)
-         flushFile(con)
-         discard c_close(ctx.`saved con`)
-         ctx.`saved con` = FileHandle(-1)
-
    if ctx.con_dup:
-      do_with(stdout)
-      do_with(stderr)
+      redirect_console_back_to(stdout, ctx.saved_stdout)
+      redirect_console_back_to(stderr, ctx.saved_stderr)
+      ctx.saved_stdout = FileHandle(-1)
+      ctx.saved_stderr = FileHandle(-1)
       ctx.con_dup = false
 
 proc reinit_vm_state(ctx: RunContext) =
