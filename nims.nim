@@ -72,6 +72,7 @@ type
       pre_load_code: string
       input_lines_good: seq[string]
 
+      con_dup: bool
       saved_stdout: FileHandle
       saved_stderr: FileHandle
 
@@ -127,6 +128,11 @@ proc refresh_failed_module_with_last_mod_time(ctx: RunContext) =
    ctx.failed_imports = ctx.failed_imports.filterIt(it.time == getLastModificationTime(it.fullname))
 
 var native_import_procs {.compileTime.} : string
+
+proc getCString*(a: VmArgs; i: Natural): cstring =
+   doAssert i < a.rc-1
+   doAssert a.slots[i+a.rb+1].kind == rkNode
+   result = a.slots[i+a.rb+1].node.strVal.cstring
 
 macro vmops(vm: PCtx, op: untyped, argtypes: varargs[untyped]): untyped =
    let op_wrapper = ident($op & "_wrapper")
@@ -356,8 +362,8 @@ proc my_read_line(ctx: RunContext): string =
             echo ":error-to-reload [on|off]  : Show/toggle syntax error to reload mode."
             echo ":max-errors [NUM]          : Show/set max compiler errors to NUM."
             echo ":option, :o                : Show current options."
-            echo ":reload, :r                : Reload the code manually."
-            echo ":reset, :rr                : Reset the vm to manually."
+            echo ":reload, :r, :rc           : Reload the code manually."
+            echo ":reset, :rr, :rrc          : Reset the vm to manually."
             echo ":go                        : Execute code in paste mode."
             echo ":exit, :q, :x              : Exit the program."
       of "exit", "quit", "q", "x":
@@ -463,8 +469,8 @@ proc my_read_line(ctx: RunContext): string =
             with_color(fgRed, false):
                echo "Load code from cache file."
          raise Reload()
-      of "reload", "r", "rs":
-         if cmd == "rs": # Clear the input buffer before reset
+      of "reload", "r", "rc":
+         if cmd == "rc": # Clear the input buffer before reload
             ctx.input_lines_good = @[]
             if opt_verbose.on:
                with_color(fgRed, false):
@@ -476,8 +482,8 @@ proc my_read_line(ctx: RunContext): string =
             with_color(fgRed, false):
                echo "Reload the code."
          raise Reload()
-      of "reset", "rr", "rrs", "rrb":
-         if cmd == "rrs": # Clear the input buffer before reset
+      of "reset", "rr", "rrc", "rrb":
+         if cmd == "rrc": # Clear the input buffer before reset
             ctx.input_lines_good = @[]
             if opt_verbose.on:
                with_color(fgRed, false):
@@ -528,6 +534,9 @@ proc my_read_line(ctx: RunContext): string =
 
       if myline in cmds_no_colon:
          myline = ":" & myline
+
+      if myline == "\4":
+         myline = ":q"
 
       let cmds = myline.replace(',', ' ').splitWhitespace
       if cmds.len > 0 and cmds[0].len > 0:
@@ -598,24 +607,28 @@ var IONBF {.importc: "_IONBF", nodecl, header: "<stdio.h>".}: cint
 proc c_setvbuf(f: File, buf: pointer, mode: cint, size: csize_t): cint {.
   importc: "setvbuf", header: "<stdio.h>", tags: [].}
 
-proc disable_stdout(ctx: RunContext) =
+proc disable_output(ctx: RunContext) =
    const device = when defined(windows): "NUL:" else: "/dev/null"
-   template do_with(con: untyped) =
-      ctx.`saved con` = c_dup(con.getFileHandle)
-      discard reopen(con, device, fmWrite)
 
-      # Set the stdout/stderr to no buffer, so stdout.write need not flush to display
-      discard c_setvbuf(con, nil, IONBF, 0)
-      flushFile(con)
+   template do_with(con: untyped) =
+      if ctx.`saved con` == FileHandle(-1):
+         ctx.`saved con` = c_dup(con.getFileHandle)
+         discard reopen(con, device, fmWrite)
+
+         # Set the stdout/stderr to no buffer, so stdout.write need not flush to display
+         discard c_setvbuf(con, nil, IONBF, 0)
+         flushFile(con)
 
    # We cannot call setStdIoUnbuffered, because set stdin to unbuffered
    # will make the program close console and run in dead cycle after using doskey F7/F8
    # function with cmd.exe.
 
-   do_with(stdout)
-   do_with(stderr)
+   if not ctx.con_dup:
+      do_with(stdout)
+      do_with(stderr)
+      ctx.con_dup = true
 
-proc enable_stdout(ctx: RunContext) =
+proc enable_output(ctx: RunContext) =
    const device = when defined(windows): "CON:" else: "/dev/tty"
 
    template do_with(con: untyped) =
@@ -624,23 +637,19 @@ proc enable_stdout(ctx: RunContext) =
          flushFile(con)
          discard c_close(ctx.`saved con`)
          ctx.`saved con` = FileHandle(-1)
-      else:
-         discard reopen(con, device, fmWrite)
 
-   do_with(stdout)
-   do_with(stderr)
+   if ctx.con_dup:
+      do_with(stdout)
+      do_with(stderr)
+      ctx.con_dup = false
 
-proc my_msg_writeln_hook(msg: string) =
-   discard
-
-proc disable_output(ctx: RunContext) =
-   ctx.conf.writelnHook = my_msg_writeln_hook
-   disable_stdout(ctx)
-
-proc enable_output(ctx: RunContext) =
-   if not ctx.conf.writelnHook.isNil:
-      ctx.conf.writelnHook = nil
-      enable_stdout(ctx)
+proc reinit_vm_state(ctx: RunContext) =
+   # Reset some variable before code execute
+   ctx.conf.errorCounter = 0
+   var vm = ctx.vm
+   vm.oldErrorCount = 0
+   vm.mode = emRepl
+   refresh(vm, ctx.main_module, ctx.idgen)
 
 proc get_line(ctx: RunContext): string =
    if ctx.last_line_has_error:
@@ -682,14 +691,6 @@ proc get_line(ctx: RunContext): string =
    ctx.last_input_line = my_read_line(ctx)
 
    return ctx.last_input_line
-
-proc reinit_vm_state(ctx: RunContext) =
-   # Reset some variable before code execute
-   ctx.conf.errorCounter = 0
-   var vm = ctx.vm
-   vm.oldErrorCount = 0
-   vm.mode = emRepl
-   refresh(vm, ctx.main_module, ctx.idgen)
 
 proc safe_compile_module(ctx: RunContext, mf: AbsoluteFile): bool =
    var
@@ -743,6 +744,9 @@ proc compile_import_module(ctx: RunContext) =
                ok_imports.add(f)
             else:
                ctx.add_failed_module(f, mf.string)
+         else:
+            with_color(fgRed, false):
+               echo "Cannot find module: ", f
 
    if ok_imports.len > 0:
       if ctx.last_input_line.startsWith(sImport) and
@@ -830,12 +834,15 @@ proc register_custom_vmops(vm: PEvalContext, ctx: RunContext) =
 
    proc now(): string = times.now().format("HH:mm:ss")
    proc today(): string = times.now().format("yyyy-MM-dd")
+   proc to_int(x: cstring): int = cast[int](x)
+
 
    vm.vm_native_proc:
       func cpu_time(): float
       func epoch_time(): float
       proc now(): string
       proc today(): string
+      proc to_int(s: cstring): int
 
    when my_special_vmops:
       vm.vm_native_proc:
@@ -1104,6 +1111,7 @@ proc set_options_from_command_line(ctx: RunContext) =
       libs.add(nimlib /../ "mylib")
 
    libs.add paths
+   libs.add "."
 
    let pkg_dir = (if getEnv("NIMBLE_DIR") != "": getEnv("NIMBLE_DIR") else: nimlib /../ "nimble") / "pkgs"
    for p in walkDir(pkg_dir):
@@ -1118,7 +1126,12 @@ proc ctrl_c_proc() {.noconv.} =
    quit "CTRL-C pressed, quit."
 
 proc main() =
-   var ctx = RunContext(max_compiler_errors: 5, saved_stdout: FileHandle(-1))
+   # We need this, because if we first do output redirect
+   # terminal default attribute will be incorrect
+   resetAttributes()
+
+   var ctx = RunContext(max_compiler_errors: 5, saved_stdout: FileHandle(-1), saved_stderr: FileHandle(-1))
+
    ctx.options.incl {opt_error_to_reload_code, opt_auto_create_var}
    when my_special_vmops:
       ctx.options.incl {opt_paste_by_input_time_elapse}
